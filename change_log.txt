@@ -1,5 +1,10 @@
 marmot-agent change log
 
 -----------------------
+june 12 2026
+- created a directory for any files the agent creats.
+- readme update with instructions on starting whisper and the TTS server
+
+-----------------------
 may 31 2026
 - initial setup

@@ -139,6 +139,9 @@ print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
 print()
 
 # ====================== TOOLS ======================
+AGENT_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "agent-data"))
+os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+
 TOOLS = [{
     "type": "function",
     "function": {
@@ -147,7 +150,7 @@ TOOLS = [{
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to run, e.g. 'ls -la ~', 'ps aux | head', 'cat README.md'"}
+                "command": {"type": "string", "description": "Shell command to run, e.g. 'ls -la', 'ps aux | head', 'cat README.md'"}
             },
             "required": ["command"]
         }
@@ -164,7 +167,7 @@ def execute_run_terminal(command: str) -> str:
             capture_output=True,
             text=True,
             timeout=TOOL_TIMEOUT,
-            cwd=os.path.expanduser("~"),
+            cwd=AGENT_DATA_DIR,
             env={**os.environ}
         )
         parts = [f"Exit code: {result.returncode}"]

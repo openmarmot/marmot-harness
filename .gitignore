@@ -40,3 +40,6 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+# Agent sandbox (tools default cwd here)
+agent-data/

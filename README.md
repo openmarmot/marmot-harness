@@ -54,7 +54,24 @@ Client plays audio, prints text, copies to clipboard.
 
 ### 1. Whisper + LLM + TTS (external)
 
-See spark-dictate README for whisper.cpp + Kokoro examples. Any compatible servers work.
+Install whisper.cpp and start the server:
+
+```bash
+./server/whisper.cpp/start_whisper_cuda.sh
+```
+
+#### Optional: Text-to-Speech (Kokoro)
+
+To enable spoken responses, run the Kokoro FastAPI TTS server (GPU):
+
+```bash
+docker run -d --gpus all \
+  -p 8880:8880 \
+  --name kokoro-tts \
+  ghcr.io/remsky/kokoro-fastapi-gpu:latest
+```
+
+During marmot server first-run setup you will be prompted for the whisper.cpp URL (e.g. `192.168.1.45:8025`), LLM base URL + model, and optional TTS base URL (e.g. `http://192.168.1.45:8880/v1`). Supported voices include `af_heart` (default), `am_adam`, etc. (see Kokoro docs).
 
 ### 2. Marmot Server
 
