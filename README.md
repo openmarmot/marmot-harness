@@ -1,5 +1,6 @@
 # marmot-harness
-![screenshot](/images/marmot-harness.jpg"A marmot in a climbing harness")
+![screenshot](/images/marmot-harness.jpg "A marmot in a climbing harness")
+
 A local voice-first AI agent with tool use. Push-to-talk (or text) → STT (whisper.cpp) → LLM with tools (ReAct/multi-turn) → TTS spoken response.
 
 ## Features
