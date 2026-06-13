@@ -9,6 +9,9 @@ Flask orchestrator:
 Rolling conversation context with:
   - configurable max tokens
   - auto-clear after N hours of inactivity (default 10h)
+  - persistent memory (≤~100 lines) extracted by asking the LLM before each full clear
+  - LLM compaction: oldest turns are summarized into compact notes when nearing token limit
+    (simple oldest-turn dropping is kept only as emergency fallback)
 """
 
 import os
@@ -128,25 +131,28 @@ MAX_TOOL_TURNS = int(config.get("MAX_TOOL_TURNS", 8))
 CONTEXT_TIMEOUT_HOURS = int(config.get("CONTEXT_TIMEOUT_HOURS", 10))
 
 last_message_time = None  # Used for auto-clearing context after long inactivity
+persistent_memory = ""  # durable notes persisted across conversation clears (bounded ~100 lines)
 
-print("🐹 Marmot Agent Server ready")
-print(f"   Whisper: {WHISPER_BASE_URL}  model={WHISPER_MODEL}")
-print(f"   LLM:     {LLM_MODEL} @ {LLM_BASE_URL}")
-print(f"   TTS:     {TTS_MODEL}/{TTS_VOICE} @ {TTS_BASE_URL or '(disabled)'}")
-print(f"   Context: ~{MAX_CONTEXT_TOKENS} tokens max (rolling)")
-print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   tool-timeout={TOOL_TIMEOUT}s")
-print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
-print()
+# Forward stubs (real implementations defined after ROLLING CONTEXT)
+def _get_memory_messages() -> list:
+    return []
 
 # ====================== TOOLS ======================
 AGENT_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "agent-data"))
 os.makedirs(AGENT_DATA_DIR, exist_ok=True)
 
+# Tool calls get their own working directory so files the agent creates (via run_terminal etc.)
+# are separated from Marmot's own data like memory.txt.
+TOOL_CALLS_DIR = os.path.join(AGENT_DATA_DIR, "tool-calls")
+os.makedirs(TOOL_CALLS_DIR, exist_ok=True)
+
+MEMORY_PATH = os.path.join(AGENT_DATA_DIR, "memory.txt")
+
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "run_terminal",
-        "description": "Execute a Linux bash command. Returns exit code + stdout + stderr. Use to explore files, run commands, check processes, edit via echo/cat etc. Prefer non-destructive commands when possible.",
+        "description": "Execute a Linux bash command (cwd is the dedicated tool-calls workspace under agent-data/tool-calls/). Returns exit code + stdout + stderr. Use to explore files, run commands, check processes, edit via echo/cat etc. Prefer non-destructive commands when possible. Created files stay isolated from Marmot's own data (e.g. memory.txt).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -167,7 +173,7 @@ def execute_run_terminal(command: str) -> str:
             capture_output=True,
             text=True,
             timeout=TOOL_TIMEOUT,
-            cwd=AGENT_DATA_DIR,
+            cwd=TOOL_CALLS_DIR,
             env={**os.environ}
         )
         parts = [f"Exit code: {result.returncode}"]
@@ -199,7 +205,10 @@ def execute_tool(tool_call: dict) -> str:
     return f"Error: unknown tool {name}"
 
 # ====================== ROLLING CONTEXT ======================
-conversation_history = []  # user + assistant messages (tool internals kept only per-turn)
+# conversation_history holds only the current session's user + final assistant turns.
+# It is managed by trim_conversation_history which *prefers* LLM-generated compaction
+# summaries over raw deletion when we approach the token limit.
+conversation_history = []  # user + assistant messages (tool internals ephemeral per turn)
 
 def estimate_tokens(x) -> int:
     if x is None:
@@ -211,23 +220,204 @@ def estimate_tokens(x) -> int:
     return max(1, len(s) // 3)  # conservative ~3 chars/token for headroom
 
 def trim_conversation_history():
+    """Ensure conversation_history (+ protected memory messages) stays under MAX_CONTEXT_TOKENS.
+
+    Preferred path: LLM compaction of oldest turns into a single dense summary message that
+    is inserted at the front of the remaining history. This preserves session coherence far
+    better than raw deletion.
+
+    Dumb per-turn popping is retained only as an emergency fallback when:
+    - We've already performed the allowed number of LLM compactions in this call, or
+    - The summarizer returns "nothing significant", or
+    - There aren't enough turns to justify a summary.
+
+    The system prompt + persistent memory messages are always protected (never compacted).
+    """
     global conversation_history
     if not conversation_history:
         return
-    sys = {"role": "system", "content": SYSTEM_PROMPT}
-    cur = [sys] + conversation_history
-    while len(cur) > 1 and estimate_tokens(cur) > MAX_CONTEXT_TOKENS:
-        cur.pop(1)  # drop oldest after system
-    conversation_history = cur[1:]
+
+    prefix = [{"role": "system", "content": SYSTEM_PROMPT}] + _get_memory_messages()
+    pfx = len(prefix)
+    max_compactions = 2  # limit expensive LLM calls per trim invocation
+    compactions = 0
+
+    while True:
+        cur = prefix + conversation_history
+        if len(cur) <= pfx or estimate_tokens(cur) <= MAX_CONTEXT_TOKENS:
+            break
+
+        # Preferred: try to compact a chunk of the oldest raw turns via LLM
+        if compactions < max_compactions:
+            total = len(conversation_history)
+            # Compact a worthwhile chunk: at least 3 turns, at most ~10 or 1/3 of history
+            chunk = min(10, max(3, total // 3))
+            if total >= 3:
+                to_compact = conversation_history[:chunk]
+                summary = summarize_for_compaction(to_compact)
+                # Drop the raw prefix we just summarized
+                conversation_history = conversation_history[chunk:]
+                low = (summary or "").lower()
+                if summary and "no significant earlier context" not in low:
+                    compacted_msg = {
+                        "role": "assistant",
+                        "content": "[Compacted summary of earlier turns in this conversation]\n" + summary.strip()
+                    }
+                    conversation_history.insert(0, compacted_msg)
+                    print(f"🗜️  Compacted {chunk} older turns into a summary note")
+                    compactions += 1
+                    continue  # check budget again
+
+        # Emergency dumb fallback: bluntly drop the single oldest conversation turn.
+        # When the front is a freshly created compaction summary we just paid an LLM call for,
+        # prefer to drop an older raw turn behind it instead (protect the value of the compaction).
+        if conversation_history:
+            if "Compacted summary" in conversation_history[0].get("content", "") and len(conversation_history) > 1:
+                del conversation_history[1]
+            else:
+                conversation_history.pop(0)
+
+# ====================== PERSISTENT MEMORY ======================
+# Small durable memory (~100 lines max) extracted from conversation before it is cleared.
+# Injected as an extra system message at the start of new conversations.
+
+def _load_persistent_memory():
+    global persistent_memory
+    if not os.path.exists(MEMORY_PATH):
+        persistent_memory = ""
+        return
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            persistent_memory = f.read()
+    except Exception as e:
+        print("Warning: could not load memory:", e)
+        persistent_memory = ""
+
+def _save_persistent_memory():
+    try:
+        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+            f.write(persistent_memory)
+    except Exception as e:
+        print("Warning: could not save memory:", e)
+
+def _get_memory_messages() -> list:
+    mem = (persistent_memory or "").strip()
+    if not mem:
+        return []
+    return [{
+        "role": "system",
+        "content": "Key facts and context remembered from previous conversations (carry these forward):\n" + mem
+    }]
+
+def _append_memory(new_text: str):
+    """Append a new memory entry (with date) and enforce ~100 line cap."""
+    global persistent_memory
+    txt = (new_text or "").strip()
+    if not txt:
+        return
+    low = txt.lower()
+    if "nothing significant" in low or "nothing to remember" in low or low in ("", "none", "n/a"):
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d")
+    entry = f"[{ts}] {txt}"
+    combined = (persistent_memory + "\n\n" + entry).strip() if persistent_memory else entry
+    lines = combined.splitlines()
+    if len(lines) > 100:
+        lines = lines[-100:]
+    persistent_memory = "\n".join(lines)
+    _save_persistent_memory()
+
+def _call_llm_simple(messages: list, max_tokens: int = 512, temperature: float = 0.2) -> str:
+    """Minimal non-tool LLM call for memory extraction and similar."""
+    try:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        r = requests.post(f"{LLM_BASE_URL}/chat/completions", json=payload, timeout=120)
+        if r.status_code == 200:
+            return (r.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        print(f"LLM (simple) HTTP {r.status_code}")
+    except Exception as e:
+        print("LLM (simple) error:", e)
+    return ""
+
+
+def summarize_for_compaction(older_turns: list) -> str:
+    """Ask the LLM for a compact summary of a prefix of older turns.
+    This is for within-session coherence when we need to reduce the rolling history
+    (different goal from the durable persistent memory extracted on full clears).
+    """
+    if not older_turns:
+        return ""
+    # Instruction scoped to "still useful right now in this conversation".
+    instruction = {
+        "role": "user",
+        "content": (
+            "The turns above are older parts of the *current ongoing conversation* and need to be compacted.\n"
+            "Create an extremely concise summary (bullets or 1-3 short paragraphs) of the user goals, key facts, decisions, important discoveries or tool outcomes, and context that the assistant must remember to remain coherent and effective for the rest of *this* session.\n"
+            "Ignore transient one-off details. If there is little still relevant, reply exactly with: No significant earlier context."
+        )
+    }
+    # Reuse main SYSTEM_PROMPT so the summarizer stays in the agent's character.
+    msgs = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + older_turns
+        + [instruction]
+    )
+    return _call_llm_simple(msgs, max_tokens=400, temperature=0.1)
+
+
+def extract_memory_from_history() -> str:
+    """Ask the LLM what (if anything) should be remembered before clearing the conversation."""
+    global conversation_history
+    if not conversation_history:
+        return ""
+    # Use the actual dialog turns + a targeted instruction.
+    # Include the main SYSTEM_PROMPT so the model stays in character for "what *I* should remember".
+    instruction = {
+        "role": "user",
+        "content": (
+            "The conversation above is about to be cleared (inactivity or explicit reset).\n"
+            "Before it is cleared, tell your future self the most important durable things to remember:\n"
+            "- User preferences, name, style, or recurring requests\n"
+            "- Key projects, tasks, files, or goals in progress\n"
+            "- Important facts, decisions, or context that will help in future conversations\n\n"
+            "Be extremely concise (a few bullets or short paragraphs at most).\n"
+            "If there is truly nothing worth carrying forward, reply with exactly: Nothing significant to remember."
+        )
+    }
+    msgs = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + conversation_history
+        + [instruction]
+    )
+    return _call_llm_simple(msgs, max_tokens=450, temperature=0.15)
+
+def commit_memory_before_clear():
+    """Extract memory from the about-to-be-cleared history and append if useful."""
+    try:
+        mem = extract_memory_from_history()
+        if mem:
+            _append_memory(mem)
+            # Keep a brief trace
+            lines = [l for l in mem.splitlines() if l.strip()]
+            print(f"🧠 Extracted memory ({len(lines)} lines) before clearing context")
+    except Exception as e:
+        print("Memory extraction failed (continuing):", e)
 
 # ====================== LLM + MULTI-TURN TOOLS ======================
 def process_with_llm(user_text: str) -> str:
-    """Core agent loop. Adds user turn, runs LLM allowing tool_calls until final message, returns text. Persists only user+final assistant."""
+    """Core agent loop. Adds user turn, runs LLM allowing tool_calls until final message, returns text.
+    trim_conversation_history (with LLM compaction) is called before adding the user turn and after the response.
+    Persists only user + final assistant messages (plus occasional compaction summaries)."""
     global conversation_history
     trim_conversation_history()
     conversation_history.append({"role": "user", "content": user_text})
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _get_memory_messages() + conversation_history
     turn = 0
     final_text = ""
 
@@ -326,6 +516,20 @@ def transcribe_audio(audio_file) -> str:
     return ""
 
 # ====================== FLASK ======================
+# Load memory (after all helper defs are registered) and emit startup banner
+_load_persistent_memory()
+_mem_lines = len([ln for ln in (persistent_memory or "").splitlines() if ln.strip()])
+
+print("🐹 Marmot Agent Server ready")
+print(f"   Whisper: {WHISPER_BASE_URL}  model={WHISPER_MODEL}")
+print(f"   LLM:     {LLM_MODEL} @ {LLM_BASE_URL}")
+print(f"   TTS:     {TTS_MODEL}/{TTS_VOICE} @ {TTS_BASE_URL or '(disabled)'}")
+print(f"   Context: ~{MAX_CONTEXT_TOKENS} tokens max (rolling + LLM compaction of old turns)")
+print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   tool-timeout={TOOL_TIMEOUT}s")
+print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
+print(f"   Memory:   {_mem_lines} lines persisted (≤100, extracted before clears)")
+print()
+
 app = Flask(__name__)
 
 @app.route("/connect", methods=["POST"])
@@ -353,6 +557,7 @@ def connect():
         delta = now - last_message_time
         if delta.total_seconds() > (CONTEXT_TIMEOUT_HOURS * 3600):
             print(f"⏰ No messages for >{CONTEXT_TIMEOUT_HOURS} hours — clearing conversation context")
+            commit_memory_before_clear()
             conversation_history.clear()
     last_message_time = now
 
@@ -384,12 +589,14 @@ def health():
         "turns": len([m for m in conversation_history if m["role"] in ("user", "assistant")]),
         "context_timeout_hours": CONTEXT_TIMEOUT_HOURS,
         "last_message_at": last_message_time.isoformat() if last_message_time else None,
-        "seconds_since_last_message": seconds_since_last
+        "seconds_since_last_message": seconds_since_last,
+        "memory_lines": len([ln for ln in (persistent_memory or "").splitlines() if ln.strip()])
     })
 
 @app.route("/reset", methods=["POST"])
 def reset():
     global conversation_history, last_message_time
+    commit_memory_before_clear()
     conversation_history = []
     last_message_time = None
     return jsonify({"ok": True, "msg": "context cleared"})
