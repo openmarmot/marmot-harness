@@ -29,6 +29,7 @@ ENV/
 **/client_config.json
 **/config.json
 **/*_config.json
+**/cron.json
 
 # Logs
 *.log

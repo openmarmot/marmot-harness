@@ -1,0 +1,17 @@
+[
+  {
+    "schedule": "0 * * * *",
+    "prompt": "Give a very short (1-2 sentence) status for the current hour. Mention the time and one observation or reminder if anything seems relevant from context or tools.",
+    "comment": "Hourly nudge. Keeps the agent lightly aware of the passage of time."
+  },
+  {
+    "schedule": "0 9 * * *",
+    "prompt": "Good morning check-in: briefly note the date/time and anything important the user might want to know or act on today.",
+    "comment": "Gentle 9am briefing. Feel free to disable or change the hour."
+  },
+  {
+    "schedule": "*/30 * * * *",
+    "prompt": "Quick systems check using tools if needed. If load, disk space, or memory looks concerning, give a short heads-up. Otherwise stay quiet.",
+    "comment": "Resource monitoring every 30 min. The prompt tells the agent to stay quiet unless there's something actionable."
+  }
+]
