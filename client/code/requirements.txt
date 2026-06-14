@@ -3,4 +3,9 @@ requests==2.34.2
 pynput==1.8.2
 sounddevice==0.5.5
 numpy==2.4.5
+opencv-python==4.13.0.92
 # wave, tempfile, subprocess, platform, json, argparse, base64 are in stdlib
+
+# opencv-python is required for detect_human() (camera snapshot + presence check
+# before the client will speak server-initiated proactive messages).
+# On first run macOS will prompt for camera permission.

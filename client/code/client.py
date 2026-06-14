@@ -7,6 +7,8 @@ Marmot Agent Client
 - Client receives transcription + AI response + audio
 - Prints "You:" (transcription) then "Marmot:" reply, plays audio, copies reply to clipboard
 - -m "text" flag: send text directly, play/print/copy response, exit (for testing)
+- Proactive messages from server are now gated by detect_human() (camera snapshot sent to
+  server's /detect; only spoken if a "person"/"human" object is reported).
 """
 
 import os
@@ -158,6 +160,8 @@ def _try_drain_proactive():
     """If the client is sufficiently unblocked, play the next buffered proactive (if any).
     Returns True if we presented one. Playback will naturally wait for any current audio
     via playback_lock inside play_wav.
+    Before playing any proactive, detect_human() is called (camera snapshot + server /detect)
+    so we only speak when a person is actually present to hear it.
     """
     item = None
     # Check recording first (don't interrupt the mic)
@@ -179,12 +183,106 @@ def _try_drain_proactive():
                 pending_proactive_queue.insert(0, item)
             return False
 
+        # === Human presence gate: only speak proactive messages if someone is actually there ===
+        if not detect_human():
+            print("👤 No human visible — deferring buffered proactive (will retry when present).")
+            with pending_proactive_lock:
+                pending_proactive_queue.insert(0, item)
+            time.sleep(1.2)  # avoid hammering the camera in tight drain loops
+            return False
+
         print(f"📤 Playing buffered proactive: {item['text'][:80]}{'...' if len(item['text']) > 80 else ''}")
         handle_response("", item["text"], item.get("audio"), proactive=True)
         # Natural pause after a spoken proactive before we consider the next thing
         time.sleep(0.75)
         return True
     return False
+
+
+# ====================== CAMERA + HUMAN PRESENCE (for gating proactive speech) ======================
+def capture_camera_image(timeout: float = 6.0) -> bytes:
+    """Capture one frame from the default webcam. Returns JPEG bytes or b'' on failure.
+
+    Uses OpenCV (opencv-python) which is now listed in requirements.txt.
+    The imagesnap CLI fallback is kept only for macOS as a last resort.
+    """
+    # Primary path: OpenCV
+    try:
+        import cv2
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            cap.release()
+            print("👁️  OpenCV could not open camera (index 0). Check permissions or camera in use.")
+            # fall through to imagesnap fallback on macOS
+        else:
+            # Let auto-exposure / white balance settle
+            for _ in range(5):
+                cap.read()
+                time.sleep(0.07)
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    return buf.tobytes()
+            print("👁️  OpenCV read a frame but it was empty.")
+    except ImportError:
+        print("👁️  opencv-python not installed. Run: pip install opencv-python")
+    except Exception as e:
+        print("👁️  OpenCV camera error:", e)
+
+    # Last-resort macOS fallback (imagesnap). Users should prefer the opencv-python path.
+    if platform.system() == "Darwin":
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = tmp.name
+            cmd = ["imagesnap", "-q", tmp_path]
+            res = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            if res.returncode == 0 and tmp_path and os.path.exists(tmp_path):
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+                return data if data else b""
+        except FileNotFoundError:
+            pass  # imagesnap not installed
+        except Exception:
+            pass
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    return b""
+
+
+def detect_human() -> bool:
+    """Capture an image from the Mac's camera and ask the Marmot server /detect endpoint
+    whether a human/person is visible. Returns True only if the server reports a relevant label.
+    """
+    img = capture_camera_image()
+    if not img:
+        print("👁️  Camera capture failed — treating as no human present (safe default).")
+        return False
+
+    try:
+        url = f"{MARMOT_BASE}/detect"
+        files = {"image": ("cam.jpg", img, "image/jpeg")}
+        resp = requests.post(url, files=files, timeout=35)
+        if resp.status_code != 200:
+            print(f"👁️  /detect failed ({resp.status_code}) — skipping proactive.")
+            return False
+
+        data = resp.json() or {}
+        objects = [str(x).lower() for x in (data.get("objects") or [])]
+        # YOLO COCO typically reports "person"; support "human" too for flexibility
+        human = any(label in ("person", "human") for label in objects)
+        print(f"👁️  Camera saw: {data.get('objects')} → human_present={human}")
+        return human
+    except Exception as e:
+        print("👁️  Human detection request error:", e)
+        return False
 
 
 # ====================== SEND TO SERVER ======================
@@ -379,8 +477,12 @@ def proactive_poller():
       playback_lock, so it will wait for any in-progress speech to finish.
     - Only when the client is fully unblocked do we poll the server for *new* proactives.
     - This gives the "small queue for proactives that get blocked" behavior.
+    - All proactive playback (fresh or buffered) is gated by detect_human() — we only
+      speak server-initiated messages when the camera sees a person ("human"/"person" label
+      from the YOLO server via /detect). If no one is there we defer and retry later.
     """
     print("   (proactive poller active — server can initiate conversations when idle)")
+    print("   (proactive speech is gated by camera human detection via opencv + server /detect)")
     base_poll_wait = 1.2  # seconds for the long-poll wait param
 
     while True:
@@ -420,8 +522,13 @@ def proactive_poller():
                         if text:
                             # Final safety checks right before presenting a fresh one
                             if not recording and not is_audio_playing() and not _is_currently_sending():
-                                handle_response("", text, audio_b64, proactive=True)
-                                time.sleep(0.9)
+                                if detect_human():
+                                    handle_response("", text, audio_b64, proactive=True)
+                                    time.sleep(0.9)
+                                else:
+                                    # No one in front of the camera — buffer locally.
+                                    # The drain path will re-check presence before speaking.
+                                    _enqueue_proactive(text, audio_b64)
                             else:
                                 # Client became busy between poll and now, or during the wait.
                                 # Buffer it locally so it plays as soon as we're unblocked.

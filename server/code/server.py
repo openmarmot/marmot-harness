@@ -52,6 +52,7 @@ def load_config():
         "TOOL_TIMEOUT": 30,
         "MAX_TOOL_TURNS": 8,
         "CONTEXT_TIMEOUT_HOURS": 10,
+        "DETECTION_BASE_URL": None,
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -62,7 +63,7 @@ def load_config():
             print("Warning: could not load config:", e)
 
     needs_save = False
-    for key in ("WHISPER_BASE_URL", "LLM_BASE_URL", "TTS_BASE_URL"):
+    for key in ("WHISPER_BASE_URL", "LLM_BASE_URL", "TTS_BASE_URL", "DETECTION_BASE_URL"):
         if cfg.get(key):
             fixed = _fix_url(cfg[key])
             if fixed != cfg[key]:
@@ -106,12 +107,18 @@ def load_config():
             cfg["TTS_VOICE"] = val
             needs_save = True
 
+    if not cfg.get("DETECTION_BASE_URL"):
+        val = input("\nEnter YOLO detection server base URL (e.g. http://localhost:8007) [Enter to skip]: ").strip()
+        if val:
+            cfg["DETECTION_BASE_URL"] = _fix_url(val)
+            needs_save = True
+
     if needs_save:
         try:
             keys = ["WHISPER_BASE_URL", "WHISPER_MODEL", "LLM_BASE_URL", "LLM_MODEL",
                     "TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "MAX_CONTEXT_TOKENS",
                     "SYSTEM_PROMPT", "TOOLS_ENABLED", "TOOL_TIMEOUT", "MAX_TOOL_TURNS",
-                    "CONTEXT_TIMEOUT_HOURS"]
+                    "CONTEXT_TIMEOUT_HOURS", "DETECTION_BASE_URL"]
             with open(CONFIG_PATH, "w") as f:
                 json.dump({k: cfg[k] for k in keys if k in cfg}, f, indent=2)
             print(f"✅ Saved config to {CONFIG_PATH}")
@@ -128,6 +135,9 @@ LLM_MODEL = config["LLM_MODEL"]
 TTS_BASE_URL = config.get("TTS_BASE_URL")
 TTS_MODEL = config.get("TTS_MODEL", "kokoro")
 TTS_VOICE = config.get("TTS_VOICE", "af_heart")
+DETECTION_BASE_URL = config.get("DETECTION_BASE_URL")
+if DETECTION_BASE_URL:
+    DETECTION_BASE_URL = _fix_url(DETECTION_BASE_URL)
 MAX_CONTEXT_TOKENS = int(config.get("MAX_CONTEXT_TOKENS", 150000))
 SYSTEM_PROMPT = config.get("SYSTEM_PROMPT", "You are a helpful agent.")
 TOOLS_ENABLED = bool(config.get("TOOLS_ENABLED", True))
@@ -529,6 +539,31 @@ def transcribe_audio(audio_file) -> str:
             pass
     return ""
 
+
+# ====================== IMAGE DETECTION (YOLO external server) ======================
+def detect_objects(image_file) -> list:
+    """Accept FileStorage (from request.files 'image' or 'file'). Forward to YOLO /upload.
+    Return list of detected object label strings (e.g. ['person', 'cat']).
+    """
+    if not DETECTION_BASE_URL:
+        return []
+    try:
+        image_bytes = image_file.read()
+        files = {"image": ("image.jpg", image_bytes)}
+        print("🖼️  Detecting objects via YOLO server...")
+        r = requests.post(f"{DETECTION_BASE_URL}/upload", files=files, timeout=120)
+        if r.status_code == 200:
+            data = r.json()
+            dets = data.get("detections", [])
+            labels = [d.get("name") for d in dets if d.get("name")]
+            print(f"   Detected: {labels}")
+            return labels
+        print(f"Detection HTTP {r.status_code}: {r.text[:200] if r.text else ''}")
+    except Exception as e:
+        print("Detection error:", e)
+    return []
+
+
 # ====================== PROACTIVE QUEUE HELPER ======================
 def queue_proactive_message(text: str, speak: bool = True) -> dict:
     """Queue a message for the client to receive on its next /poll when idle.
@@ -593,6 +628,7 @@ print("🐹 Marmot Agent Server ready")
 print(f"   Whisper: {WHISPER_BASE_URL}  model={WHISPER_MODEL}")
 print(f"   LLM:     {LLM_MODEL} @ {LLM_BASE_URL}")
 print(f"   TTS:     {TTS_MODEL}/{TTS_VOICE} @ {TTS_BASE_URL or '(disabled)'}")
+print(f"   Detection: {DETECTION_BASE_URL or '(disabled)'}")
 print(f"   Context: ~{MAX_CONTEXT_TOKENS} tokens max (rolling + LLM compaction of old turns)")
 print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   tool-timeout={TOOL_TIMEOUT}s")
 print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
@@ -658,6 +694,7 @@ def health():
         "whisper": WHISPER_BASE_URL,
         "llm": LLM_MODEL,
         "tts": bool(TTS_BASE_URL),
+        "detection": DETECTION_BASE_URL,
         "turns": len([m for m in conversation_history if m["role"] in ("user", "assistant")]),
         "context_timeout_hours": CONTEXT_TIMEOUT_HOURS,
         "last_message_at": last_message_time.isoformat() if last_message_time else None,
@@ -746,6 +783,26 @@ def inject():
     item = queue_proactive_message(text, speak=speak)
     return jsonify({"ok": True, "queued": bool(item), "message": item})
 
+
+@app.route("/detect", methods=["POST"])
+def detect():
+    """Detect objects in an uploaded image using the external YOLO server.
+    Accepts multipart form with 'image' or 'file'.
+    Returns {"objects": ["label", "label", ...]} (just the class names).
+    """
+    if not DETECTION_BASE_URL:
+        return jsonify({"error": "Detection server not configured"}), 503
+
+    image_file = None
+    if request.files:
+        image_file = request.files.get("file") or request.files.get("image")
+    if not image_file or not getattr(image_file, "filename", None):
+        return jsonify({"error": "Send image file as 'image' or 'file' form field"}), 400
+
+    labels = detect_objects(image_file)
+    return jsonify({"objects": labels})
+
+
 class QuietPollRequestHandler(WSGIRequestHandler):
     """Custom request handler that suppresses log spam from the frequent /poll endpoint
     used for server-initiated (proactive) messages. All other endpoints continue to log normally.
@@ -758,6 +815,6 @@ class QuietPollRequestHandler(WSGIRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("MARMOT_PORT", 5000))
-    print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset  /poll  /inject")
+    print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset  /poll  /inject  /detect")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True,
             request_handler=QuietPollRequestHandler)
