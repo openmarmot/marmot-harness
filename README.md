@@ -15,7 +15,7 @@ Push-to-talk (or text) → STT (whisper.cpp) → LLM with tools (ReAct/multi-tur
 - Final response spoken via local TTS (Kokoro-style `/audio/speech`) and returned
 - Text response printed + copied to clipboard
 - `-m "text here"` client flag for quick text-only queries (no mic, exits after one response)
-- Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject`
+- Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject` (see [docs/API.md](docs/API.md))
 - Server can initiate conversations (client polls `/poll` when idle; proactives play audio without overlapping prior speech)
 - Auto-clears conversation context after 10 hours of inactivity (configurable)
 
@@ -141,97 +141,16 @@ The client will show:
 
 Useful for debugging without touching the mic, and for scripting.
 
-### API
+## API
 
-`POST /connect`
+See [docs/API.md](docs/API.md) for the complete API reference, including:
 
-- `multipart/form-data` with `file=@recording.wav` → audio path
-- `application/json` `{ "text": "your question" }` → text path
-
-Returns:
-
-```json
-{
-  "transcription": "what the user said (from audio or the text you sent)",
-  "text": "Here is the answer...",
-  "audio": "UklGRiQ...base64 wav..."   // or null
-}
-```
-
-Other endpoints:
-- `GET /health`
-- `POST /reset` (clears conversation history)
-- `GET /poll` — client background poll (supports `?wait=2.5` for long-poll style). Returns `{"action":"initiate","message":{text,audio,id}}` when the server has something queued, or `{"action":"noop"}`.
-- `POST /inject` — queue a proactive message for delivery on the next client poll (for testing or future schedulers/background logic). Body: `{"text": "Hey, the build finished.", "speak": true}`
-
-Server-initiated (proactive) messages:
-- When the interactive client is idle (not recording, not already speaking a response, not mid-request), its background poller will pick up queued messages.
-- The proactive text is appended to conversation context on the server (so follow-up hotkey responses continue the thread naturally).
-- Audio is auto-played but **never overlaps** previous audio (playback is serialized).
-- If the client is busy (recording, in the middle of a response, or audio still playing) when a proactive arrives from the server, it is buffered in a small local queue (max 4) on the client and played automatically as soon as the client becomes unblocked. The server already committed these messages to conversation context at delivery time.
-- Text is printed with a `(proactive)` label, copied to clipboard, and spoken if TTS audio was provided.
-
-### Testing with curl
-
-Here are handy `curl` commands for testing the server directly (especially useful during development or when the Python client isn't available).
-
-**Health check**
-```bash
-curl -s http://localhost:5000/health | jq
-```
-
-**Send a text query** (recommended for quick tests)
-```bash
-curl -s -X POST http://localhost:5000/connect \
-  -H "Content-Type: application/json" \
-  -d '{"text": "what is the current hostname and kernel version?"}' | jq
-```
-
-**Send text and print only the response** (clean output)
-```bash
-curl -s -X POST http://localhost:5000/connect \
-  -H "Content-Type: application/json" \
-  -d '{"text": "list the top 5 processes by memory usage"}' | jq -r '.text'
-```
-
-**Send text and save the spoken audio reply**
-```bash
-curl -s -X POST http://localhost:5000/connect \
-  -H "Content-Type: application/json" \
-  -d '{"text": "tell me a short joke about marmots"}' \
-  | jq -r '.audio' | base64 -d > /tmp/marmot_reply.wav \
-  && echo "Saved audio to /tmp/marmot_reply.wav"
-```
-
-**Send an audio file** (multipart upload)
-```bash
-curl -s -X POST http://localhost:5000/connect \
-  -F "file=@/path/to/your/recording.wav" | jq -r '.text'
-```
-
-**Reset conversation context**
-```bash
-curl -s -X POST http://localhost:5000/reset | jq
-```
-
-**Queue a proactive message (server initiates)**
-```bash
-curl -s -X POST http://localhost:5000/inject \
-  -H "Content-Type: application/json" \
-  -d '{"text": "The long-running job you started earlier just completed successfully.", "speak": true}' | jq
-```
-The next time the interactive client is idle it will receive it via its `/poll` background loop, print it with a `(proactive)` label, copy to clipboard, and speak the audio (if TTS is enabled). The message is also recorded in the rolling conversation context.
-
-> **Tip**: Replace `localhost:5000` with your server's address if it's running elsewhere.  
-> `jq` is recommended for readable JSON (install with `sudo apt install jq` or equivalent).  
-> Useful fields: `.transcription` (what the user said), `.text` (Marmot's reply), `.audio` (base64 wav or null).
-
-Example to show both sides:
-```bash
-curl -s -X POST http://localhost:5000/connect \
-  -H "Content-Type: application/json" \
-  -d '{"text": "list files in ~"}' | jq '{transcription, text}'
-```
+- `POST /connect` (primary endpoint)
+- `GET /health`, `POST /reset`
+- `GET /poll` (client proactive polling, with long-poll support)
+- `POST /inject` (manually queue server-initiated messages)
+- Full details on server-initiated (proactive) conversations
+- Many `curl` examples for testing the server directly
 
 ## Tool Use (ReAct style)
 

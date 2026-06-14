@@ -26,6 +26,7 @@ import uuid
 from collections import deque
 from flask import Flask, request, jsonify
 import requests
+from werkzeug.serving import WSGIRequestHandler
 
 # ========================= CONFIG =========================
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -745,7 +746,18 @@ def inject():
     item = queue_proactive_message(text, speak=speak)
     return jsonify({"ok": True, "queued": bool(item), "message": item})
 
+class QuietPollRequestHandler(WSGIRequestHandler):
+    """Custom request handler that suppresses log spam from the frequent /poll endpoint
+    used for server-initiated (proactive) messages. All other endpoints continue to log normally.
+    """
+    def log_request(self, code='-', size='-'):
+        if self.path and self.path.startswith('/poll'):
+            return  # too noisy when the client is polling every ~1s
+        super().log_request(code, size)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("MARMOT_PORT", 5000))
     print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset  /poll  /inject")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True,
+            request_handler=QuietPollRequestHandler)
