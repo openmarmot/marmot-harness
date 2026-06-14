@@ -15,7 +15,8 @@ Push-to-talk (or text) → STT (whisper.cpp) → LLM with tools (ReAct/multi-tur
 - Final response spoken via local TTS (Kokoro-style `/audio/speech`) and returned
 - Text response printed + copied to clipboard
 - `-m "text here"` client flag for quick text-only queries (no mic, exits after one response)
-- Simple Flask server with `/connect`, `/health`, `/reset`
+- Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject`
+- Server can initiate conversations (client polls `/poll` when idle; proactives play audio without overlapping prior speech)
 - Auto-clears conversation context after 10 hours of inactivity (configurable)
 
 ## Architecture
@@ -160,6 +161,15 @@ Returns:
 Other endpoints:
 - `GET /health`
 - `POST /reset` (clears conversation history)
+- `GET /poll` — client background poll (supports `?wait=2.5` for long-poll style). Returns `{"action":"initiate","message":{text,audio,id}}` when the server has something queued, or `{"action":"noop"}`.
+- `POST /inject` — queue a proactive message for delivery on the next client poll (for testing or future schedulers/background logic). Body: `{"text": "Hey, the build finished.", "speak": true}`
+
+Server-initiated (proactive) messages:
+- When the interactive client is idle (not recording, not already speaking a response, not mid-request), its background poller will pick up queued messages.
+- The proactive text is appended to conversation context on the server (so follow-up hotkey responses continue the thread naturally).
+- Audio is auto-played but **never overlaps** previous audio (playback is serialized).
+- If the client is busy (recording, in the middle of a response, or audio still playing) when a proactive arrives from the server, it is buffered in a small local queue (max 4) on the client and played automatically as soon as the client becomes unblocked. The server already committed these messages to conversation context at delivery time.
+- Text is printed with a `(proactive)` label, copied to clipboard, and spoken if TTS audio was provided.
 
 ### Testing with curl
 
@@ -203,6 +213,14 @@ curl -s -X POST http://localhost:5000/connect \
 ```bash
 curl -s -X POST http://localhost:5000/reset | jq
 ```
+
+**Queue a proactive message (server initiates)**
+```bash
+curl -s -X POST http://localhost:5000/inject \
+  -H "Content-Type: application/json" \
+  -d '{"text": "The long-running job you started earlier just completed successfully.", "speak": true}' | jq
+```
+The next time the interactive client is idle it will receive it via its `/poll` background loop, print it with a `(proactive)` label, copy to clipboard, and speak the audio (if TTS is enabled). The message is also recorded in the rolling conversation context.
 
 > **Tip**: Replace `localhost:5000` with your server's address if it's running elsewhere.  
 > `jq` is recommended for readable JSON (install with `sudo apt install jq` or equivalent).  

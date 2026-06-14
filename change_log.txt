@@ -1,4 +1,4 @@
-marmot-agent change log
+marmot-harness change log
 
 -----------------------
 june 12 2026

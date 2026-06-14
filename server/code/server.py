@@ -20,6 +20,10 @@ import tempfile
 import subprocess
 import base64
 import datetime
+import threading
+import time
+import uuid
+from collections import deque
 from flask import Flask, request, jsonify
 import requests
 
@@ -132,6 +136,15 @@ CONTEXT_TIMEOUT_HOURS = int(config.get("CONTEXT_TIMEOUT_HOURS", 10))
 
 last_message_time = None  # Used for auto-clearing context after long inactivity
 persistent_memory = ""  # durable notes persisted across conversation clears (bounded ~100 lines)
+
+# ====================== PROACTIVE INITIATION (server -> client) ======================
+# Client polls /poll when idle. Server can queue messages it wants to deliver unprompted.
+# Items are dicts: {"id": str, "text": str, "audio": base64 or None, "created_at": iso}
+pending_initiations = deque()
+pending_lock = threading.Lock()
+initiation_ready = threading.Condition(pending_lock)  # allows efficient long-poll wakeups
+MAX_PENDING_INITIATIONS = 5
+MAX_INITIATION_AGE_SECONDS = 1800  # 30 minutes
 
 # Forward stubs (real implementations defined after ROLLING CONTEXT)
 def _get_memory_messages() -> list:
@@ -515,6 +528,61 @@ def transcribe_audio(audio_file) -> str:
             pass
     return ""
 
+# ====================== PROACTIVE QUEUE HELPER ======================
+def queue_proactive_message(text: str, speak: bool = True) -> dict:
+    """Queue a message for the client to receive on its next /poll when idle.
+    If speak and TTS is configured, pre-generates the audio at enqueue time.
+    Returns the queued item dict. Thread-safe. Enforces size + age limits.
+    """
+    global pending_initiations
+    if not text or not text.strip():
+        return {}
+
+    audio_b64 = None
+    if speak and TTS_BASE_URL:
+        try:
+            audio_bytes = generate_tts_audio(text)
+            if audio_bytes:
+                audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        except Exception as e:
+            print("Proactive TTS generation failed:", e)
+
+    item = {
+        "id": str(uuid.uuid4()),
+        "text": text.strip(),
+        "audio": audio_b64,
+        "created_at": datetime.datetime.now().isoformat()
+    }
+
+    with pending_lock:
+        # Drop anything too old
+        now = datetime.datetime.now()
+        while pending_initiations:
+            oldest = pending_initiations[0]
+            try:
+                created = datetime.datetime.fromisoformat(oldest["created_at"])
+                if (now - created).total_seconds() > MAX_INITIATION_AGE_SECONDS:
+                    pending_initiations.popleft()
+                    print("🗑️  Dropped stale proactive message (age)")
+                    continue
+            except Exception:
+                pending_initiations.popleft()
+                continue
+            break
+
+        # Enforce max depth (drop oldest if full)
+        while len(pending_initiations) >= MAX_PENDING_INITIATIONS:
+            dropped = pending_initiations.popleft()
+            print(f"🗑️  Dropped oldest proactive (queue full): {dropped['text'][:60]}...")
+
+        pending_initiations.append(item)
+        # Wake any long-poll waiters
+        initiation_ready.notify_all()
+
+    print(f"📣 Queued proactive message (queue size={len(pending_initiations)}): {text[:80]}{'...' if len(text) > 80 else ''}")
+    return item
+
+
 # ====================== FLASK ======================
 # Load memory (after all helper defs are registered) and emit startup banner
 _load_persistent_memory()
@@ -581,6 +649,9 @@ def health():
     if last_message_time is not None:
         seconds_since_last = int((now - last_message_time).total_seconds())
 
+    with pending_lock:
+        pending_count = len(pending_initiations)
+
     return jsonify({
         "ok": True,
         "whisper": WHISPER_BASE_URL,
@@ -590,7 +661,8 @@ def health():
         "context_timeout_hours": CONTEXT_TIMEOUT_HOURS,
         "last_message_at": last_message_time.isoformat() if last_message_time else None,
         "seconds_since_last_message": seconds_since_last,
-        "memory_lines": len([ln for ln in (persistent_memory or "").splitlines() if ln.strip()])
+        "memory_lines": len([ln for ln in (persistent_memory or "").splitlines() if ln.strip()]),
+        "pending_initiations": pending_count
     })
 
 @app.route("/reset", methods=["POST"])
@@ -599,9 +671,81 @@ def reset():
     commit_memory_before_clear()
     conversation_history = []
     last_message_time = None
+    with pending_lock:
+        pending_initiations.clear()
     return jsonify({"ok": True, "msg": "context cleared"})
+
+@app.route("/poll", methods=["GET"])
+def poll():
+    """Client idle poll. Returns a proactive initiation if one is queued (and commits it to conversation history).
+    Supports optional long-poll via ?wait=seconds (capped at 10).
+    """
+    global last_message_time, conversation_history
+
+    wait = 0.0
+    try:
+        wait = float(request.args.get("wait", "0") or "0")
+    except Exception:
+        wait = 0.0
+    wait = max(0.0, min(wait, 10.0))
+
+    deadline = time.time() + wait
+
+    while True:
+        with initiation_ready:
+            # Prune stale inside the lock
+            now = datetime.datetime.now()
+            while pending_initiations:
+                try:
+                    oldest = pending_initiations[0]
+                    created = datetime.datetime.fromisoformat(oldest["created_at"])
+                    if (now - created).total_seconds() > MAX_INITIATION_AGE_SECONDS:
+                        pending_initiations.popleft()
+                        continue
+                except Exception:
+                    pending_initiations.popleft()
+                    continue
+                break
+
+            if pending_initiations:
+                item = pending_initiations.popleft()
+                # Commit this as an assistant turn so the conversation continues naturally
+                conversation_history.append({"role": "assistant", "content": item["text"]})
+                last_message_time = datetime.datetime.now()
+                # Trim opportunistically (cheap if not near limit)
+                try:
+                    trim_conversation_history()
+                except Exception:
+                    pass
+                print(f"📤 Delivering proactive via /poll: {item['text'][:100]}{'...' if len(item['text']) > 100 else ''}")
+                return jsonify({"action": "initiate", "message": item})
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return jsonify({"action": "noop"})
+
+            # Efficiently wait for a new enqueue or timeout slice
+            initiation_ready.wait(timeout=min(remaining, 1.0))
+
+@app.route("/inject", methods=["POST"])
+def inject():
+    """Manual/test hook to queue a proactive message from outside (e.g. scripts, future schedulers).
+    Body: {"text": "message here", "speak": true}
+    """
+    if not request.is_json:
+        return jsonify({"error": "expected application/json"}), 400
+    data = request.json or {}
+    text = (data.get("text") or "").strip()
+    speak = data.get("speak", True)
+    if not isinstance(speak, bool):
+        speak = str(speak).lower() in ("1", "true", "yes", "on")
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    item = queue_proactive_message(text, speak=speak)
+    return jsonify({"ok": True, "queued": bool(item), "message": item})
 
 if __name__ == "__main__":
     port = int(os.environ.get("MARMOT_PORT", 5000))
-    print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset")
+    print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset  /poll  /inject")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
