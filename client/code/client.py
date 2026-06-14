@@ -188,7 +188,8 @@ def _try_drain_proactive():
             print("👤 No human visible — deferring buffered proactive (will retry when present).")
             with pending_proactive_lock:
                 pending_proactive_queue.insert(0, item)
-            time.sleep(1.2)  # avoid hammering the camera in tight drain loops
+            defer_sleep = BACKOFF_INTERVAL if _is_in_backoff_mode() else 1.2
+            time.sleep(defer_sleep)  # back off to ~1/min when no recent user activity
             return False
 
         print(f"📤 Playing buffered proactive: {item['text'][:80]}{'...' if len(item['text']) > 80 else ''}")
@@ -197,6 +198,17 @@ def _try_drain_proactive():
         time.sleep(0.75)
         return True
     return False
+
+
+def _mark_user_interaction():
+    """Record that the user is present (either via hotkey or successful camera human detection)."""
+    global last_user_interaction
+    last_user_interaction = time.time()
+
+
+def _is_in_backoff_mode() -> bool:
+    """True if we have not seen a user interaction (record button or human on camera) recently."""
+    return (time.time() - last_user_interaction) > USER_INTERACTION_TIMEOUT
 
 
 # ====================== CAMERA + HUMAN PRESENCE (for gating proactive speech) ======================
@@ -278,6 +290,8 @@ def detect_human() -> bool:
         objects = [str(x).lower() for x in (data.get("objects") or [])]
         # YOLO COCO typically reports "person"; support "human" too for flexibility
         human = any(label in ("person", "human") for label in objects)
+        if human:
+            _mark_user_interaction()  # Successful human detection counts as user interaction/presence
         print(f"👁️  Camera saw: {data.get('objects')} → human_present={human}")
         return human
     except Exception as e:
@@ -359,6 +373,14 @@ MAX_LOCAL_PROACTIVE_QUEUE = 4
 pending_proactive_queue = []
 pending_proactive_lock = threading.Lock()
 
+# Last "user presence" marker for backoff logic.
+# Updated on: user pressing the record hotkey, or successful detect_human() (human seen by camera).
+last_user_interaction = time.time()
+USER_INTERACTION_TIMEOUT = 5 * 60   # 5 minutes with no interaction → enter backoff
+NORMAL_POLL_WAIT = 1.2              # seconds for normal /poll long-wait
+BACKOFF_POLL_WAIT = 10.0            # server caps long-poll at 10s
+BACKOFF_INTERVAL = 60.0             # target check rate (poll + camera) when backed off
+
 def callback(indata, frames, time_info, status):
     if status:
         print("Audio status:", status)
@@ -370,6 +392,7 @@ def start_recording():
     with lock:
         audio_data = []
         recording = True
+    _mark_user_interaction()  # User is actively present (hit the hotkey)
     print("🎤 Recording... (hold Right ⌥ / Alt)")
     try:
         stream = sd.InputStream(samplerate=16000, channels=1, dtype="float32", callback=callback)
@@ -480,10 +503,13 @@ def proactive_poller():
     - All proactive playback (fresh or buffered) is gated by detect_human() — we only
       speak server-initiated messages when the camera sees a person ("human"/"person" label
       from the YOLO server via /detect). If no one is there we defer and retry later.
+    - After 5 minutes with no "user interaction" (record hotkey press or successful
+      detect_human()), the poller and camera checks back off to approximately once per minute
+      to avoid unnecessary work / camera use when the user is away.
     """
     print("   (proactive poller active — server can initiate conversations when idle)")
     print("   (proactive speech is gated by camera human detection via opencv + server /detect)")
-    base_poll_wait = 1.2  # seconds for the long-poll wait param
+    print("   (polling + camera checks back off to ~1/min after 5 min with no user interaction)")
 
     while True:
         try:
@@ -506,12 +532,20 @@ def proactive_poller():
                 time.sleep(0.3)
                 continue
 
-            # Poll the server (with moderate wait for decent latency)
+            # Choose poll aggressiveness based on recent user activity (record button or camera seeing a human)
+            if _is_in_backoff_mode():
+                poll_wait = BACKOFF_POLL_WAIT      # use server's max long-poll (10s)
+                post_poll_sleep = BACKOFF_INTERVAL - poll_wait  # ~50s to reach ~1/min total
+            else:
+                poll_wait = NORMAL_POLL_WAIT
+                post_poll_sleep = 0.25
+
+            # Poll the server (long-poll when possible)
             try:
                 resp = requests.get(
                     f"{MARMOT_BASE}/poll",
-                    params={"wait": base_poll_wait},
-                    timeout=base_poll_wait + 2.0
+                    params={"wait": poll_wait},
+                    timeout=poll_wait + 2.0
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -542,8 +576,9 @@ def proactive_poller():
                 time.sleep(2.0)
                 continue
 
-            # Small natural idle between checks when using wait (keeps CPU low)
-            time.sleep(0.25)
+            # Natural idle / backoff sleep (keeps CPU + camera low when user is away)
+            if post_poll_sleep > 0:
+                time.sleep(post_poll_sleep)
 
         except Exception as e:
             print("Poller outer error:", e)

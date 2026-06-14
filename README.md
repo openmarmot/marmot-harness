@@ -15,8 +15,9 @@ Push-to-talk (or text) → STT (whisper.cpp) → LLM with tools (ReAct/multi-tur
 - Final response spoken via local TTS (Kokoro-style `/audio/speech`) and returned
 - Text response printed + copied to clipboard
 - `-m "text here"` client flag for quick text-only queries (no mic, exits after one response)
-- Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject` (see [docs/API.md](docs/API.md))
-- Server can initiate conversations (client polls `/poll` when idle; proactives play audio without overlapping prior speech)
+- Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject`, and `/detect` (image → object labels via external YOLO server; see [docs/API.md](docs/API.md))
+- Server can initiate conversations (client polls `/poll` when idle)
+- Proactive messages are gated by client-side camera human detection: the client captures a webcam frame and calls the server's `/detect` endpoint; messages are only spoken if a person is visible ("person" or "human" label). Includes client-side backoff to ~1 check per minute after 5 min of inactivity.
 - Auto-clears conversation context after 10 hours of inactivity (configurable)
 
 ## Architecture
@@ -41,17 +42,21 @@ record (16kHz + gain + pad)  ──▶   /connect (audio or text)
 
 Client plays audio, prints text, copies to clipboard.
 
+The client can also capture webcam frames and call the server's new `/detect` endpoint (proxied to an external YOLO server) to determine whether a human is present before speaking server-initiated proactive messages.
+
 ## Requirements
 
 **Client machine:**
 - Python 3.10+
 - Microphone (for hotkey mode)
+- Camera + `opencv-python` (recommended; required for the client-side human presence detection that gates proactive/spoken messages from the server)
 - Same clipboard tools as spark-dictate (`wl-clipboard` or `xclip` on Linux)
 
 **Servers (designed for NVIDIA CUDA):**
 - whisper.cpp server (CUDA) on port 8025 (or your choice)
 - OpenAI-compatible LLM server (vLLM, llama.cpp server, Ollama OpenAI compat, etc.)
 - Kokoro FastAPI or other TTS exposing `/v1/audio/speech` (optional but recommended)
+- Yolo image detection server : https://github.com/openmarmot/image_collection
 
 **LLM Endpoint:**
 - designed for local LLM endpoint using vLLM
@@ -91,7 +96,8 @@ cd server
 First run will interactively ask for:
 - whisper.cpp URL
 - LLM base URL + model
-- TTS base URL + voice (optional)
+- TTS base URL + voice 
+- YOLO detection server base URL 
 
 Settings saved to `server/code/config.json`.
 
@@ -105,6 +111,8 @@ cd client
 ```
 
 First run prompts for Marmot server address (e.g. `localhost:5000` or remote IP).
+
+On macOS the client will request camera permission (required for the human-presence check that controls whether proactive messages are spoken). `opencv-python` must be installed (see `client/code/requirements.txt`).
 
 ## Usage
 
@@ -149,7 +157,8 @@ See [docs/API.md](docs/API.md) for the complete API reference, including:
 - `GET /health`, `POST /reset`
 - `GET /poll` (client proactive polling, with long-poll support)
 - `POST /inject` (manually queue server-initiated messages)
-- Full details on server-initiated (proactive) conversations
+- `POST /detect` (upload image → returns list of detected object labels via external YOLO server)
+- Full details on server-initiated (proactive) conversations, including client-side human presence gating via camera + `/detect`
 - Many `curl` examples for testing the server directly
 
 ## Tool Use (ReAct style)
@@ -174,8 +183,9 @@ Key fields:
 - `TOOL_TIMEOUT`: seconds per `run_terminal` call (default 30)
 - `MAX_TOOL_TURNS`: safety cap on ReAct iterations (default 8)
 - `CONTEXT_TIMEOUT_HOURS`: hours of inactivity before automatically clearing conversation context (default: 10)
+- `DETECTION_BASE_URL`: optional base URL of the external YOLO detection server (enables `POST /detect` for client camera-based human presence checks before proactives)
 
-Client: `client/code/client_config.json` (only server address + gain).
+Client: `client/code/client_config.json` (only server address + gain). On the client, `opencv-python` is required for the webcam feature used to gate proactives.
 
 ## Security Note
 

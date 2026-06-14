@@ -27,13 +27,34 @@ The primary endpoint used by the client for both voice and text interactions.
 
 ## Other endpoints
 
-- `GET /health` — Returns server status, current context size, last message time, pending proactive count, etc.
+- `GET /health` — Returns server status, current context size, last message time, pending proactive count, detection server config, etc.
 - `POST /reset` — Clears the rolling conversation history (also extracts persistent memory before clearing).
-- `GET /poll` — Internal endpoint used by the interactive client. Supports optional long-poll via `?wait=2.5`.  
+- `GET /poll` — Internal endpoint used by the interactive client. Supports optional long-poll via `?wait=` (capped at 10s by the server).  
   Returns `{"action":"initiate","message":{...}}` when the server has a queued proactive message, or `{"action":"noop"}`.
 - `POST /inject` — Manually queue a proactive (server-initiated) message.  
   Body example: `{ "text": "Hey, the build finished.", "speak": true }`  
   Useful for testing or from external scripts / future background logic.
+- `POST /detect` — Accepts an image and returns a list of detected object labels (e.g. `{"objects": ["person", "laptop"]}`). Used by the client for camera-based human presence checks before speaking proactive messages. Requires an external YOLO detection server (configured via `DETECTION_BASE_URL`).
+
+## POST /detect
+
+Accepts an image (via multipart upload) and returns the object labels detected by a configured external YOLO-based image recognition server.
+
+**Input**
+
+- `multipart/form-data` with `image=@snapshot.jpg` **or** `file=@snapshot.jpg`
+
+**Response**
+
+```json
+{
+  "objects": ["person", "laptop", "chair"]
+}
+```
+
+- Returns a flat list of class names (strings) as reported by the YOLO model (e.g. COCO classes: "person", "cat", "bottle", etc.).
+- The interactive client calls this (after capturing a webcam frame) to decide whether to speak a proactive message. It considers a human present if `"person"` or `"human"` appears in the list.
+- The Marmot server itself does not run YOLO — it proxies the image to the external detection server specified by `DETECTION_BASE_URL` (set during first-run setup or in `server/code/config.json`). If no detection server is configured, `/detect` returns an error.
 
 ### Server-initiated (proactive) messages
 
@@ -41,7 +62,9 @@ The primary endpoint used by the client for both voice and text interactions.
 - The proactive text is appended to the conversation context on the server (so follow-up hotkey responses continue the thread naturally).
 - Audio is auto-played but **never overlaps** previous audio (playback is serialized on the client).
 - If the client is busy (recording, in the middle of a response, or audio still playing) when a proactive arrives from the server, it is buffered in a small local queue (max 4) on the client and played automatically as soon as the client becomes unblocked. The server has already committed these messages to conversation context at delivery time.
-- On the client, proactives are printed with a `(proactive)` label, copied to the clipboard, and spoken (when audio is present).
+- **Human presence gating**: Before speaking any proactive message (fresh or from the local buffer), the client captures a frame from the webcam and calls `POST /detect`. The message is only spoken if the result contains `"person"` or `"human"`. This prevents the agent from talking to an empty room.
+- Client-side backoff: After 5 minutes with no "user interaction" (pressing the record hotkey or a successful human detection via camera), the client backs off its `/poll` and camera checks to approximately once per minute.
+- On the client, proactives are printed with a `(proactive)` label, copied to the clipboard, and spoken (when audio is present). Camera access (and `opencv-python`) is required on the client machine for the human-presence feature.
 
 ## Testing with curl
 
@@ -93,6 +116,14 @@ curl -s -X POST http://localhost:5000/inject \
   -d '{"text": "The long-running job you started earlier just completed successfully.", "speak": true}' | jq
 ```
 The next time the interactive client is idle it will receive it via its `/poll` background loop, print it with a `(proactive)` label, copy to clipboard, and speak the audio (if TTS is enabled). The message is also recorded in the rolling conversation context.
+
+**Check for humans/objects in an image (via the /detect endpoint)**
+```bash
+curl -s -X POST http://localhost:5000/detect \
+  -F "image=@/tmp/webcam.jpg" | jq
+```
+
+Returns something like `{"objects": ["person", "keyboard", "cup"]}`. The interactive client uses this internally (after grabbing a webcam frame) to decide whether to speak proactive messages. The server forwards the image to the external YOLO detection server configured at startup (`DETECTION_BASE_URL`).
 
 > **Tip**: Replace `localhost:5000` with your server's address if it's running elsewhere.  
 > `jq` is recommended for readable JSON (install with `sudo apt install jq` or equivalent).  
