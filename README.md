@@ -18,6 +18,7 @@ Push-to-talk (or text) → STT (whisper.cpp) → LLM with tools (ReAct/multi-tur
 - Simple Flask server with `/connect`, `/health`, `/reset`, `/poll`, `/inject`, and `/detect` (image → object labels via external YOLO server; see [docs/API.md](docs/API.md))
 - Server can initiate conversations (client polls `/poll` when idle)
 - Proactive messages are gated by client-side camera human detection: the client captures a webcam frame and calls the server's `/detect` endpoint; messages are only spoken if a person is visible ("person" or "human" label). Includes client-side backoff to ~1 check per minute after 5 min of inactivity.
+- Optional scheduled cron jobs (`server/code/cron.json`): write simple schedule + prompt entries (with optional `"enabled": false` and `"comment"`). The server runs enabled prompts through the LLM (with tools) on schedule and delivers the reply as a proactive message. Copy `cron.json.example` to start. "comment" fields are supported for notes and ignored by the server.
 - Auto-clears conversation context after 10 hours of inactivity (configurable)
 
 ## Architecture
@@ -158,6 +159,7 @@ See [docs/API.md](docs/API.md) for the complete API reference, including:
 - `GET /poll` (client proactive polling, with long-poll support)
 - `POST /inject` (manually queue server-initiated messages)
 - `POST /detect` (upload image → returns list of detected object labels via external YOLO server)
+- Scheduled cron jobs / proactive prompts via `server/code/cron.json` (results delivered through the same proactive path)
 - Full details on server-initiated (proactive) conversations, including client-side human presence gating via camera + `/detect`
 - Many `curl` examples for testing the server directly
 
@@ -184,6 +186,22 @@ Key fields:
 - `MAX_TOOL_TURNS`: safety cap on ReAct iterations (default 8)
 - `CONTEXT_TIMEOUT_HOURS`: hours of inactivity before automatically clearing conversation context (default: 10)
 - `DETECTION_BASE_URL`: optional base URL of the external YOLO detection server (enables `POST /detect` for client camera-based human presence checks before proactives)
+
+### Scheduled prompts (cron jobs)
+
+Optional `server/code/cron.json` lets the server run prompts on a schedule. The LLM response (full tool use + context supported) is delivered exactly like other proactive messages.
+
+- Copy `server/code/cron.json.example` → `cron.json` to get started.
+- Simple format:
+  ```json
+  [
+    { "schedule": "0 * * * *", "prompt": "Give a short hourly status.", "enabled": true, "comment": "optional note for humans" }
+  ]
+  ```
+- Standard 5-field cron supported (`*`, lists, ranges, steps like `*/15`).
+- `"enabled": false` (or omitted, defaults to true) lets you keep jobs in the file without them running.
+- Use `GET /health` to see loaded jobs (including disabled), last-run times, and enabled state (`cron_jobs` and `cron` fields).
+- "comment" and other extra fields are ignored.
 
 Client: `client/code/client_config.json` (only server address + gain). On the client, `opencv-python` is required for the webcam feature used to gate proactives.
 

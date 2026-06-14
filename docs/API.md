@@ -140,7 +140,7 @@ curl -s -X POST http://localhost:5000/connect \
 
 The server can load scheduled jobs from `server/code/cron.json` (copy `cron.json.example` to start).
 
-- JSON array of objects: `{ "schedule": "...", "prompt": "...", "comment": "optional human note (ignored)" }`. Only schedule + prompt are required.
+- JSON array of objects: `{ "schedule": "...", "prompt": "...", "enabled": true, "comment": "optional note (ignored)" }`. Only "schedule" + "prompt" are required. `"enabled"` defaults to true.
 - Standard 5-field cron (supports `*`, lists, ranges, steps like `*/15`).
 - The prompt is executed internally against the LLM (tools + full context work). Result is sent through `queue_proactive_message()`.
 - In-memory last execution time per job prevents duplicate firing for the same time slot.

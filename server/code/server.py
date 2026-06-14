@@ -150,12 +150,14 @@ persistent_memory = ""  # durable notes persisted across conversation clears (bo
 
 # ====================== SIMPLE CRON JOBS ======================
 # Cron jobs are loaded once at startup from server/code/cron.json (optional; copy cron.json.example to get started).
-# Format (JSON array of simple objects). Only "schedule", "prompt", and optional "id" are used.
-# Extra fields are ignored. "comment" is explicitly supported for human-readable notes.
+# Format (JSON array of simple objects). Only "schedule" + "prompt" are required.
+# Supported fields per job: "schedule", "prompt", optional "id", "enabled" (bool, defaults true), "comment" (ignored).
+# Extra/unknown fields are ignored.
 # [
 #   {
 #     "schedule": "0 * * * *",
 #     "prompt": "Give a short hourly status note.",
+#     "enabled": true,
 #     "comment": "This runs every hour on the hour. Feel free to change the text."
 #   }
 # ]
@@ -165,7 +167,7 @@ persistent_memory = ""  # durable notes persisted across conversation clears (bo
 # and used to avoid duplicate runs for the same time slot (deduped at minute granularity).
 
 CRON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cron.json")
-cron_jobs = []  # list of {"id": str, "schedule": str, "prompt": str, "last_run": datetime|None}
+cron_jobs = []  # list of {"id": str, "schedule": str, "prompt": str, "enabled": bool, "last_run": datetime|None}
 
 def _cron_field_values(field: str, min_val: int, max_val: int) -> set:
     """Expand cron field like '*', '5', '1,3', '*/15', '9-17', '1-10/2' into set of ints."""
@@ -263,6 +265,13 @@ def load_cron_jobs():
                 continue
             # "comment" (and any other extra keys) are allowed for human notes and are deliberately ignored.
             comment = entry.get("comment")  # optional human-readable note only
+
+            # "enabled" defaults to true so old configs keep working. Accepts bool or common string forms.
+            enabled = entry.get("enabled", True)
+            if isinstance(enabled, str):
+                enabled = enabled.lower() not in ("0", "false", "no", "off", "disabled")
+            enabled = bool(enabled)
+
             sched = str(entry.get("schedule", "")).strip()
             prompt = str(entry.get("prompt", "")).strip()
             if not sched or not prompt:
@@ -272,11 +281,17 @@ def load_cron_jobs():
                 "id": jid,
                 "schedule": sched,
                 "prompt": prompt,
+                "enabled": enabled,
                 "last_run": None
             })
         if cron_jobs:
-            schedules = ", ".join(j["schedule"] for j in cron_jobs)
-            print(f"⏰ Loaded {len(cron_jobs)} cron job(s): {schedules}")
+            enabled_jobs = [j for j in cron_jobs if j.get("enabled", True)]
+            schedules = ", ".join(j["schedule"] for j in enabled_jobs)
+            total = len(cron_jobs)
+            if len(enabled_jobs) < total:
+                print(f"⏰ Loaded {len(enabled_jobs)}/{total} cron job(s) ({total - len(enabled_jobs)} disabled): {schedules}")
+            else:
+                print(f"⏰ Loaded {total} cron job(s): {schedules}")
     except Exception as e:
         print("Warning: could not load cron.json:", e)
 
@@ -767,7 +782,8 @@ def start_cron_scheduler():
     Due jobs run their prompt through the LLM (internal=True so history stays clean) and
     the resulting text is queued as a proactive message (which will be spoken + added to
     conversation on delivery, exactly like other proactive messages)."""
-    if not cron_jobs:
+    enabled_jobs = [j for j in cron_jobs if j.get("enabled", True)]
+    if not enabled_jobs:
         return
 
     def _cron_loop():
@@ -776,6 +792,8 @@ def start_cron_scheduler():
                 time.sleep(30)  # minute-granularity crons are well served by 30s checks
                 now = datetime.datetime.now()
                 for job in cron_jobs:
+                    if not job.get("enabled", True):
+                        continue
                     sched = job.get("schedule", "")
                     prompt = job.get("prompt", "")
                     if not sched or not prompt:
@@ -803,7 +821,7 @@ def start_cron_scheduler():
 
     t = threading.Thread(target=_cron_loop, daemon=True, name="marmot-cron")
     t.start()
-    print(f"⏰ Cron scheduler started for {len(cron_jobs)} job(s)")
+    print(f"⏰ Cron scheduler started for {len(enabled_jobs)} job(s)")
 
 
 # ====================== FLASK ======================
@@ -823,7 +841,10 @@ print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   tool-timeout={TOOL_TIME
 print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
 print(f"   Memory:   {_mem_lines} lines persisted (≤100, extracted before clears)")
 if cron_jobs:
-    print(f"   Cron:     {len(cron_jobs)} job(s) from cron.json (in-memory last-run tracking)")
+    en = sum(1 for j in cron_jobs if j.get("enabled", True))
+    dis = len(cron_jobs) - en
+    extra = f" ({dis} disabled)" if dis else ""
+    print(f"   Cron:     {en} job(s) from cron.json{extra}")
 print()
 
 app = Flask(__name__)
@@ -883,6 +904,7 @@ def health():
     cron_summary = [
         {
             "schedule": j["schedule"],
+            "enabled": j.get("enabled", True),
             "last_run": j["last_run"].isoformat() if j.get("last_run") else None
         }
         for j in cron_jobs
