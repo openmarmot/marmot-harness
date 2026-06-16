@@ -647,7 +647,7 @@ def process_with_llm(user_text: str, internal: bool = False) -> str:
     return final_text
 
 # ====================== TTS ======================
-def generate_tts_audio(text: str) -> bytes:
+def generate_tts_audio(text: str, quiet: bool = False) -> bytes:
     if not text or not TTS_BASE_URL:
         return b""
     try:
@@ -657,11 +657,19 @@ def generate_tts_audio(text: str) -> bytes:
             "voice": TTS_VOICE,
             "response_format": "wav"
         }
-        print("🔊 TTS synthesis...")
+        if not quiet:
+            print("🔊 TTS synthesis...")
         r = requests.post(f"{TTS_BASE_URL}/audio/speech", json=payload, timeout=180)
         if r.status_code == 200 and r.content:
             return r.content
-        print(f"TTS {r.status_code}: {r.text[:150] if r.text else ''}")
+        if r.status_code == 200:
+            # 200 but no bytes: the TTS server accepted the request but generated no audio data.
+            # Common causes: specific voice unavailable in this container/image (af_heart is flaky),
+            # or the Kokoro service itself has stopped synthesizing (stale container, GPU issue, etc).
+            print(f"TTS {r.status_code} but 0-byte body (no audio generated). voice={TTS_VOICE}")
+            print("   Suggestion: restart the Kokoro TTS container, or try a different TTS_VOICE in config.json (am_adam / af_bella often more reliable).")
+        else:
+            print(f"TTS {r.status_code}: {r.text[:150] if r.text else ''}")
     except Exception as e:
         print("TTS error:", e)
     return b""
@@ -847,7 +855,361 @@ if cron_jobs:
     print(f"   Cron:     {en} job(s) from cron.json{extra}")
 print()
 
+# Quick TTS probe so users immediately see if the configured voice is producing audio.
+# (Some Kokoro deploys return 200 + empty body for certain voices like af_heart.)
+if TTS_BASE_URL:
+    try:
+        probe = generate_tts_audio("Hi.", quiet=True)
+        if probe:
+            print(f"   TTS probe: OK ({len(probe)} bytes)")
+        else:
+            print("⚠️  TTS probe returned no audio for current voice. See above for details / voice suggestions.")
+    except Exception as _e:
+        print("⚠️  TTS probe error (non-fatal):", _e)
+
 app = Flask(__name__)
+
+# ====================== SIMPLE STATUS DASHBOARD ======================
+# Served at GET /  — a lightweight, auto-refreshing page showing /health data.
+# The mascot is embedded as a data URL so the page is completely self-contained.
+MARMOT_B64 = ""
+try:
+    img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "images", "marmot-harness.jpg")
+    with open(img_path, "rb") as f:
+        MARMOT_B64 = base64.b64encode(f.read()).decode("ascii")
+except Exception as e:
+    print("Warning: could not load mascot image for dashboard:", e)
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Marmot • Status</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
+    :root { font-family: Inter, system_ui, sans-serif; }
+    .font-display { font-family: "Space Grotesk", Inter, system_ui, sans-serif; }
+    .status-dot { width: 10px; height: 10px; border-radius: 9999px; }
+    .card { transition: transform 0.1s ease, box-shadow 0.1s ease; }
+    .card:hover { transform: translateY(-1px); box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .section-title { font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 600; color: #64748b; }
+    .health-value { font-size: 15px; font-weight: 600; line-height: 1.1; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-200">
+  <div class="max-w-4xl mx-auto px-6 py-8">
+    <!-- Header -->
+    <div class="flex items-start justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <img id="mascot" 
+             src="data:image/jpeg;base64,MARMOT_B64_HERE" 
+             alt="Marmot mascot" 
+             class="w-20 h-20 rounded-3xl object-cover ring-1 ring-white/10 shadow-xl shadow-black/50">
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-4xl font-semibold tracking-tighter font-display">Marmot</h1>
+            <div class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium flex items-center gap-1">
+              <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></div>
+              LIVE
+            </div>
+          </div>
+          <p class="text-slate-400 text-sm mt-0.5">Local voice-first AI agent • Status dashboard</p>
+        </div>
+      </div>
+
+      <div class="text-right text-xs text-slate-500 pt-1">
+        <div>Port <span class="text-slate-400 font-medium" id="port">5000</span></div>
+        <div id="updated" class="text-[10px] mt-0.5">—</div>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="mt-6 flex flex-wrap items-center gap-2">
+      <button onclick="refreshHealth()" 
+              class="inline-flex items-center gap-2 rounded-2xl bg-slate-900 hover:bg-slate-800 active:bg-slate-950 border border-slate-700 px-4 py-2 text-sm font-medium transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.058 11H1M12 3v2m0 16v2m9-9H15m-6 0a8 8 0 01-.938-1.5M12 21a8 8 0 01-1.5-.938" />
+        </svg>
+        Refresh
+      </button>
+
+      <button onclick="resetContext()" 
+              class="inline-flex items-center gap-2 rounded-2xl bg-red-950/60 hover:bg-red-950 border border-red-900/70 text-red-300 px-4 py-2 text-sm font-medium transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.595 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.595-1.858L5 7m5 4v6m4-6v6m1-10V9a1 1 0 00-1-1H9a1 1 0 00-1 1v1m-1 4h10" />
+        </svg>
+        Reset Context
+      </button>
+
+      <div class="flex-1"></div>
+
+      <div class="text-xs px-3 py-1.5 rounded-2xl bg-slate-900 border border-slate-800 text-slate-400 flex items-center gap-2">
+        <span>Auto-refresh</span> 
+        <span class="font-mono text-emerald-400">5s</span>
+      </div>
+    </div>
+
+    <!-- Services -->
+    <div class="mt-6">
+      <div class="section-title mb-2 px-1">Services</div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3" id="services">
+        <!-- JS populated cards -->
+      </div>
+    </div>
+
+    <!-- Context & Memory -->
+    <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-3">
+      <div class="card bg-slate-900 border border-slate-800 rounded-3xl p-5">
+        <div class="section-title mb-3">Conversation</div>
+        <div class="space-y-3">
+          <div class="flex justify-between items-baseline">
+            <div class="text-slate-400 text-sm">Active turns</div>
+            <div id="turns" class="health-value text-3xl tabular-nums font-semibold text-white">—</div>
+          </div>
+          <div>
+            <div class="flex justify-between text-sm mb-1">
+              <span class="text-slate-400">Last message</span>
+              <span id="last-seen" class="font-medium text-slate-300 tabular-nums">—</span>
+            </div>
+            <div id="last-at" class="text-[10px] text-slate-500 mono">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card bg-slate-900 border border-slate-800 rounded-3xl p-5">
+        <div class="section-title mb-3">Memory &amp; Proactive</div>
+        <div class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+          <div>
+            <div class="text-slate-400">Persistent memory</div>
+            <div id="memory-lines" class="health-value text-2xl font-semibold tabular-nums">—</div>
+            <div class="text-[10px] text-slate-500">lines saved</div>
+          </div>
+          <div>
+            <div class="text-slate-400">Pending proactive</div>
+            <div id="pending" class="health-value text-2xl font-semibold tabular-nums">—</div>
+            <div class="text-[10px] text-slate-500">queued for delivery</div>
+          </div>
+          <div class="col-span-2 pt-1 border-t border-slate-800 text-xs">
+            Context auto-clears after <span id="ctx-timeout" class="font-medium text-slate-300 tabular-nums">—</span> hours of inactivity
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cron -->
+    <div class="mt-6">
+      <div class="flex items-center justify-between mb-2 px-1">
+        <div class="section-title">Cron Jobs</div>
+        <div id="cron-count" class="text-xs text-slate-400"></div>
+      </div>
+      <div id="cron-list" class="flex flex-wrap gap-2 text-sm">
+        <!-- JS populated schedule pills -->
+      </div>
+      <div id="cron-empty" class="text-xs text-slate-500 px-1 hidden">No cron jobs configured (copy cron.json.example to get started).</div>
+    </div>
+
+    <!-- Footer -->
+    <div class="mt-8 pt-5 border-t border-slate-800 text-xs text-slate-500 flex items-center justify-between">
+      <div>
+        Data from <a href="/health" class="text-slate-400 hover:text-slate-300 underline">/health</a>. 
+        All state lives on the server.
+      </div>
+      <div class="text-[10px]">Marmot harness</div>
+    </div>
+  </div>
+
+<script>
+let lastSeconds = null;
+let lastUpdateTs = Date.now();
+
+function tailwindInit() {
+  // Tailwind script already loaded via CDN; any custom config could go here.
+}
+
+function formatAgo(seconds) {
+  if (seconds == null) return "never";
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return seconds + "s ago";
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  return h + "h " + (m % 60) + "m ago";
+}
+
+function updateRelativeTimes() {
+  if (lastSeconds == null) return;
+  // Decrement locally for smooth "live" feel between full fetches
+  const elapsed = Math.floor((Date.now() - lastUpdateTs) / 1000);
+  const current = Math.max(0, lastSeconds + elapsed);
+  const el = document.getElementById("last-seen");
+  if (el) el.textContent = formatAgo(current);
+}
+
+function renderServices(data) {
+  const container = document.getElementById("services");
+  if (!container) return;
+  container.innerHTML = "";
+
+  const services = [
+    { key: "whisper", label: "Whisper", value: data.whisper || "—", sub: data.whisper_model || "", on: !!data.whisper },
+    { key: "llm", label: "LLM", value: data.llm || "—", sub: data.llm_base_url || "", on: true },
+    { key: "tts", label: "TTS", value: data.tts ? ((data.tts_model || "tts") + " / " + (data.tts_voice || "")) : "disabled", sub: data.tts ? "" : "", on: !!data.tts },
+    { key: "detect", label: "Detection", value: data.detection || "disabled", sub: "", on: !!data.detection }
+  ];
+
+  services.forEach(s => {
+    const div = document.createElement("div");
+    div.className = "bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex flex-col";
+    const dotColor = s.on ? "bg-emerald-400" : "bg-slate-600";
+    const valueText = s.on ? s.value : `<span class="text-slate-400">${s.value}</span>`;
+
+    div.innerHTML = `
+      <div class="flex items-center gap-2">
+        <div class="status-dot ${dotColor} ${s.on ? '' : 'opacity-60'} ring-1 ring-inset ring-white/10"></div>
+        <div class="text-xs font-medium tracking-wider text-slate-400">${s.label}</div>
+      </div>
+      <div class="mt-1.5">
+        <div class="health-value break-all">${valueText}</div>
+        ${s.sub ? `<div class="text-[10px] text-slate-500 mono mt-0.5 truncate">${s.sub}</div>` : ''}
+      </div>
+    `;
+    container.appendChild(div);
+  });
+}
+
+function renderCron(data) {
+  const list = document.getElementById("cron-list");
+  const empty = document.getElementById("cron-empty");
+  const countEl = document.getElementById("cron-count");
+  if (!list || !empty || !countEl) return;
+
+  list.innerHTML = "";
+  empty.classList.add("hidden");
+
+  const crons = data.cron || [];
+  const total = data.cron_jobs || 0;
+  const enabled = crons.filter(c => c.enabled).length;
+
+  countEl.textContent = total ? `${enabled}/${total} enabled` : "";
+
+  if (crons.length === 0) {
+    empty.classList.remove("hidden");
+    return;
+  }
+
+  crons.forEach(c => {
+    const pill = document.createElement("div");
+    const isOn = c.enabled !== false;
+    pill.className = `px-3 py-1 rounded-2xl text-xs border flex items-center gap-1.5 ${isOn ? 'bg-emerald-900/30 border-emerald-800 text-emerald-300' : 'bg-slate-800 border-slate-700 text-slate-400'}`;
+
+    const last = c.last_run ? new Date(c.last_run).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "never";
+    pill.innerHTML = `
+      <span class="font-medium">${c.schedule}</span>
+      ${!isOn ? '<span class="text-[10px] opacity-60">(off)</span>' : ''}
+      <span class="opacity-50 text-[10px]">• last ${last}</span>
+    `;
+    list.appendChild(pill);
+  });
+}
+
+async function fetchHealth() {
+  try {
+    const res = await fetch("/health", { cache: "no-store" });
+    if (!res.ok) throw new Error("bad status " + res.status);
+    const data = await res.json();
+
+    // Services
+    renderServices(data);
+
+    // Conversation stats
+    document.getElementById("turns").textContent = data.turns ?? "—";
+    document.getElementById("memory-lines").textContent = data.memory_lines ?? "—";
+    document.getElementById("pending").textContent = data.pending_initiations ?? "—";
+    document.getElementById("ctx-timeout").textContent = data.context_timeout_hours ?? "—";
+
+    // Last message
+    const lastSeenEl = document.getElementById("last-seen");
+    const lastAtEl = document.getElementById("last-at");
+
+    if (data.seconds_since_last_message != null) {
+      lastSeconds = data.seconds_since_last_message;
+      lastUpdateTs = Date.now();
+      lastSeenEl.textContent = formatAgo(lastSeconds);
+      lastAtEl.textContent = data.last_message_at ? new Date(data.last_message_at).toLocaleString() : "—";
+    } else {
+      lastSeenEl.textContent = "never";
+      lastAtEl.textContent = "—";
+      lastSeconds = null;
+    }
+
+    // Cron
+    renderCron(data);
+
+    // Updated time
+    const upd = document.getElementById("updated");
+    upd.textContent = "updated " + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+
+    // Also expose port if we can (static for now)
+    const portEl = document.getElementById("port");
+    if (portEl && location.port) portEl.textContent = location.port;
+
+  } catch (e) {
+    console.warn("Health fetch failed", e);
+    const container = document.getElementById("services");
+    if (container) {
+      container.innerHTML = `<div class="col-span-full text-sm text-red-400 bg-red-950/40 border border-red-900 rounded-2xl p-4">Unable to reach /health — is the Marmot server running?</div>`;
+    }
+  }
+}
+
+async function resetContext() {
+  if (!confirm("Clear the current conversation context and extract memory?")) return;
+  try {
+    const res = await fetch("/reset", { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    // brief flash
+    const btns = document.querySelectorAll("button");
+    btns.forEach(b => b.disabled = true);
+    await fetchHealth();
+    setTimeout(() => {
+      btns.forEach(b => b.disabled = false);
+    }, 600);
+  } catch (e) {
+    alert("Reset failed: " + e);
+  }
+}
+
+function refreshHealth() {
+  fetchHealth();
+}
+
+function startAutoRefresh() {
+  // Initial fetch
+  fetchHealth();
+  // Full refresh every 5 seconds
+  setInterval(fetchHealth, 5000);
+  // Smooth relative time updates every 1s
+  setInterval(updateRelativeTimes, 1000);
+}
+
+window.onload = function() {
+  tailwindInit();
+  startAutoRefresh();
+};
+</script>
+</body>
+</html>
+"""
+INDEX_HTML = INDEX_HTML.replace("MARMOT_B64_HERE", MARMOT_B64)
+
+@app.route("/", methods=["GET"])
+def index():
+    """Simple self-contained status dashboard. Refreshes automatically."""
+    return INDEX_HTML
+
 
 @app.route("/connect", methods=["POST"])
 def connect():
@@ -913,8 +1275,12 @@ def health():
     return jsonify({
         "ok": True,
         "whisper": WHISPER_BASE_URL,
+        "whisper_model": WHISPER_MODEL,
         "llm": LLM_MODEL,
+        "llm_base_url": LLM_BASE_URL,
         "tts": bool(TTS_BASE_URL),
+        "tts_model": TTS_MODEL if TTS_BASE_URL else None,
+        "tts_voice": TTS_VOICE if TTS_BASE_URL else None,
         "detection": DETECTION_BASE_URL,
         "turns": len([m for m in conversation_history if m["role"] in ("user", "assistant")]),
         "context_timeout_hours": CONTEXT_TIMEOUT_HOURS,
@@ -1027,18 +1393,22 @@ def detect():
 
 
 class QuietPollRequestHandler(WSGIRequestHandler):
-    """Custom request handler that suppresses log spam from the frequent /poll endpoint
-    used for server-initiated (proactive) messages. All other endpoints continue to log normally.
+    """Custom request handler that suppresses log spam from frequent endpoints
+    (/poll for the proactive client, and GET /health for the status dashboard auto-refresh).
+    All other endpoints continue to log normally.
     """
     def log_request(self, code='-', size='-'):
-        if self.path and self.path.startswith('/poll'):
-            return  # too noisy when the client is polling every ~1s
+        if self.path:
+            path = self.path.split('?', 1)[0]
+            if path.startswith('/poll') or path == '/health':
+                return  # keep console clean for high-frequency polling/status endpoints
         super().log_request(code, size)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("MARMOT_PORT", 5000))
     start_cron_scheduler()
-    print(f"🌐 http://0.0.0.0:{port}   /connect  /health  /reset  /poll  /inject  /detect")
+    print(f"🌐 Dashboard: http://0.0.0.0:{port}/")
+    print(f"   API:      /connect  /health  /reset  /poll  /inject  /detect")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True,
             request_handler=QuietPollRequestHandler)

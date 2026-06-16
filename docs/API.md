@@ -27,7 +27,8 @@ The primary endpoint used by the client for both voice and text interactions.
 
 ## Other endpoints
 
-- `GET /health` — Returns server status, current context size, last message time, pending proactive count, detection server config, etc.
+- `GET /` — Simple self-contained status dashboard. Shows live health data, services, context/memory stats, cron jobs, and the mascot image. Auto-refreshes every 5 seconds. Includes a one-click "Reset Context" button.
+- `GET /health` — Returns server status, current context size, last message time, pending proactive count, detection server config, plus service models/voices. The dashboard consumes this endpoint.
 - `POST /reset` — Clears the rolling conversation history (also extracts persistent memory before clearing).
 - `GET /poll` — Internal endpoint used by the interactive client. Supports optional long-poll via `?wait=` (capped at 10s by the server).  
   Returns `{"action":"initiate","message":{...}}` when the server has a queued proactive message, or `{"action":"noop"}`.
