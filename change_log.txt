@@ -1,6 +1,10 @@
 marmot-harness change log
 
 -----------------------
+june 15 2026
+- / now is a simple website displaying the system health in a easy to read format
+- minor adjustments
+-----------------------
 june 14 2026
 - the client now polls the server, giving the server the ability to initiate a conversation
 - the server does not console log poll requests to reduce spam
