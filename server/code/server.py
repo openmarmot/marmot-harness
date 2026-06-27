@@ -49,12 +49,14 @@ def load_config():
         "TTS_MODEL": "kokoro",
         "TTS_VOICE": "af_heart",
         "MAX_CONTEXT_TOKENS": 150000,
-        "SYSTEM_PROMPT": "You are Marmot, a helpful local AI agent running on the user's machine. You have tools to inspect and control the Linux system. Use tools when needed to answer accurately. Be concise in final answers. Always think step-by-step before calling tools.",
+        "SYSTEM_PROMPT": "You are Marmot, a helpful local AI agent running on the user's machine. You have tools to inspect and control the Linux system and to search the web for current events or facts not on this machine. Use tools when needed to answer accurately. Be concise in final answers. Always think step-by-step before calling tools.",
         "TOOLS_ENABLED": True,
         "TOOL_TIMEOUT": 30,
         "MAX_TOOL_TURNS": 8,
         "CONTEXT_TIMEOUT_HOURS": 10,
         "DETECTION_BASE_URL": None,
+        "WEB_SEARCH_ENABLED": True,
+        "BRAVE_SEARCH_API_KEY": None,
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -120,7 +122,8 @@ def load_config():
             keys = ["WHISPER_BASE_URL", "WHISPER_MODEL", "LLM_BASE_URL", "LLM_MODEL",
                     "TTS_BASE_URL", "TTS_MODEL", "TTS_VOICE", "MAX_CONTEXT_TOKENS",
                     "SYSTEM_PROMPT", "TOOLS_ENABLED", "TOOL_TIMEOUT", "MAX_TOOL_TURNS",
-                    "CONTEXT_TIMEOUT_HOURS", "DETECTION_BASE_URL"]
+                    "CONTEXT_TIMEOUT_HOURS", "DETECTION_BASE_URL",
+                    "WEB_SEARCH_ENABLED", "BRAVE_SEARCH_API_KEY"]
             with open(CONFIG_PATH, "w") as f:
                 json.dump({k: cfg[k] for k in keys if k in cfg}, f, indent=2)
             print(f"✅ Saved config to {CONFIG_PATH}")
@@ -146,6 +149,8 @@ TOOLS_ENABLED = bool(config.get("TOOLS_ENABLED", True))
 TOOL_TIMEOUT = int(config.get("TOOL_TIMEOUT", 30))
 MAX_TOOL_TURNS = int(config.get("MAX_TOOL_TURNS", 8))
 CONTEXT_TIMEOUT_HOURS = int(config.get("CONTEXT_TIMEOUT_HOURS", 10))
+WEB_SEARCH_ENABLED = bool(config.get("WEB_SEARCH_ENABLED", True))
+BRAVE_SEARCH_API_KEY = (config.get("BRAVE_SEARCH_API_KEY") or "").strip() or None
 
 last_message_time = None  # Used for auto-clearing context after long inactivity
 persistent_memory = ""  # durable notes persisted across conversation clears (bounded ~100 lines)
@@ -352,7 +357,7 @@ os.makedirs(TOOL_CALLS_DIR, exist_ok=True)
 
 MEMORY_PATH = os.path.join(AGENT_DATA_DIR, "memory.txt")
 
-TOOLS = [{
+_RUN_TERMINAL_TOOL = {
     "type": "function",
     "function": {
         "name": "run_terminal",
@@ -365,7 +370,27 @@ TOOLS = [{
             "required": ["command"]
         }
     }
-}]
+}
+
+_WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web via Brave Search for current events, news, documentation, or facts not available on this machine. Returns titles, snippets, and URLs. Summarize findings in your final answer; do not read URLs aloud.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query, e.g. 'Python 3.13 release date' or 'weather San Francisco'"},
+                "max_results": {"type": "integer", "description": "Number of results to return (1-10, default 5)"}
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+TOOLS = [_RUN_TERMINAL_TOOL]
+if WEB_SEARCH_ENABLED and BRAVE_SEARCH_API_KEY:
+    TOOLS.append(_WEB_SEARCH_TOOL)
 
 def execute_run_terminal(command: str) -> str:
     if not command or not command.strip():
@@ -397,6 +422,54 @@ def execute_run_terminal(command: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
+def execute_web_search(query: str, max_results: int = 5) -> str:
+    if not BRAVE_SEARCH_API_KEY:
+        return "Error: web search not configured (set BRAVE_SEARCH_API_KEY in config.json)"
+    q = (query or "").strip()
+    if not q:
+        return "Error: empty query"
+    try:
+        n = int(max_results)
+    except (TypeError, ValueError):
+        n = 5
+    n = max(1, min(n, 10))
+    try:
+        r = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+            },
+            params={"q": q, "count": n},
+            timeout=TOOL_TIMEOUT,
+        )
+        if r.status_code != 200:
+            detail = (r.text or "")[:500]
+            return f"Error: Brave Search HTTP {r.status_code}" + (f" — {detail}" if detail else "")
+        data = r.json()
+        results = (data.get("web") or {}).get("results") or []
+        if not results:
+            return f"No results for: {q}"
+        parts = [f"Query: {q}", f"Results ({len(results)}):"]
+        for i, item in enumerate(results, 1):
+            title = (item.get("title") or "(no title)").strip()
+            url = (item.get("url") or "").strip()
+            desc = (item.get("description") or "").strip()
+            block = f"{i}. {title}"
+            if desc:
+                block += f"\n   {desc}"
+            if url:
+                block += f"\n   {url}"
+            parts.append(block)
+        out = "\n\n".join(parts)
+        if len(out) > 7000:
+            out = out[:7000] + "\n[truncated]"
+        return out
+    except requests.Timeout:
+        return f"Error: timed out after {TOOL_TIMEOUT}s"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 def execute_tool(tool_call: dict) -> str:
     fn = tool_call.get("function", {})
     name = fn.get("name", "")
@@ -406,6 +479,8 @@ def execute_tool(tool_call: dict) -> str:
         args = {}
     if name == "run_terminal":
         return execute_run_terminal(args.get("command", ""))
+    if name == "web_search":
+        return execute_web_search(args.get("query", ""), args.get("max_results", 5))
     return f"Error: unknown tool {name}"
 
 # ====================== ROLLING CONTEXT ======================
@@ -967,7 +1042,10 @@ print(f"   LLM:     {LLM_MODEL} @ {LLM_BASE_URL}")
 print(f"   TTS:     {TTS_MODEL}/{TTS_VOICE} @ {TTS_BASE_URL or '(disabled)'}")
 print(f"   Detection: {DETECTION_BASE_URL or '(disabled)'}")
 print(f"   Context: ~{MAX_CONTEXT_TOKENS} tokens max (rolling + LLM compaction of old turns)")
-print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   tool-timeout={TOOL_TIMEOUT}s")
+_tool_names = ", ".join(t["function"]["name"] for t in TOOLS) if TOOLS else "(none)"
+print(f"   Tools:   {'on' if TOOLS_ENABLED else 'off'}   [{_tool_names}]   tool-timeout={TOOL_TIMEOUT}s")
+if WEB_SEARCH_ENABLED and not BRAVE_SEARCH_API_KEY:
+    print("   Web search: disabled (set BRAVE_SEARCH_API_KEY in config.json)")
 print(f"   Inactivity timeout: {CONTEXT_TIMEOUT_HOURS}h → auto-clear context")
 print(f"   Memory:   {_mem_lines} lines persisted (≤100, extracted before clears)")
 if cron_jobs:

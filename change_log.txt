@@ -2,6 +2,7 @@ marmot-harness change log
 
 -----------------------
 june 27 2026
+- added web_search tool (Brave Search API) to the server; set BRAVE_SEARCH_API_KEY in config.json to enable
 - added a chat interface to the main web page.
 - adjusted health checks to catch issues with tts and stt servers
 - minor adjustments
