@@ -15,7 +15,9 @@ Rolling conversation context with:
 """
 
 import os
+import io
 import json
+import wave
 import tempfile
 import subprocess
 import base64
@@ -163,11 +165,34 @@ persistent_memory = ""  # durable notes persisted across conversation clears (bo
 # ]
 # Standard 5-field cron (min hour dom month dow). Supports *, ranges, lists, and steps (e.g. */5, 1-10/2).
 # Each job's prompt is sent (internally) to the LLM with full tool access (ReAct). The final response text
-# is queued via queue_proactive_message(). Last execution time per job is kept in memory only (reset on restart)
-# and used to avoid duplicate runs for the same time slot (deduped at minute granularity).
+# is queued via queue_proactive_message(). Last execution time per job is persisted in cron_state.json and
+# used to avoid duplicate runs for the same time slot (deduped at minute granularity).
 
 CRON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cron.json")
+CRON_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cron_state.json")
 cron_jobs = []  # list of {"id": str, "schedule": str, "prompt": str, "enabled": bool, "last_run": datetime|None}
+
+def _load_cron_state() -> dict:
+    """Return {job_id: isoformat str} from disk."""
+    if not os.path.exists(CRON_STATE_PATH):
+        return {}
+    try:
+        with open(CRON_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print("Warning: could not load cron_state.json:", e)
+        return {}
+
+def _save_cron_last_run(job_id: str, when: datetime.datetime) -> None:
+    state = _load_cron_state()
+    state[job_id] = when.isoformat()
+    try:
+        with open(CRON_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+    except Exception as e:
+        print("Warning: could not save cron_state.json:", e)
 
 def _cron_field_values(field: str, min_val: int, max_val: int) -> set:
     """Expand cron field like '*', '5', '1,3', '*/15', '9-17', '1-10/2' into set of ints."""
@@ -260,6 +285,7 @@ def load_cron_jobs():
         if not isinstance(data, list):
             print("Warning: cron.json must be a JSON array of {schedule, prompt} objects")
             return
+        saved_runs = _load_cron_state()
         for i, entry in enumerate(data):
             if not isinstance(entry, dict):
                 continue
@@ -277,12 +303,19 @@ def load_cron_jobs():
             if not sched or not prompt:
                 continue
             jid = str(entry.get("id") or f"{sched}:{i}")
+            last_run = None
+            saved = saved_runs.get(jid)
+            if saved:
+                try:
+                    last_run = datetime.datetime.fromisoformat(saved)
+                except Exception:
+                    pass
             cron_jobs.append({
                 "id": jid,
                 "schedule": sched,
                 "prompt": prompt,
                 "enabled": enabled,
-                "last_run": None
+                "last_run": last_run
             })
         if cron_jobs:
             enabled_jobs = [j for j in cron_jobs if j.get("enabled", True)]
@@ -674,6 +707,38 @@ def generate_tts_audio(text: str, quiet: bool = False) -> bytes:
         print("TTS error:", e)
     return b""
 
+TTS_PROBE_TEXT = "Hi."
+TTS_PROBE_MIN_BYTES = 1000  # WAV header + real audio (0-byte 200s mean Kokoro GPU is broken)
+TTS_PROBE_CACHE_SECONDS = 60
+_tts_probe_cache = {"ok": None, "bytes": 0, "error": None, "checked_at": None}
+_tts_probe_lock = threading.Lock()
+
+def probe_tts_synthesis(force: bool = False) -> dict:
+    """Check whether Kokoro is actually returning audio (not just HTTP 200 + empty body).
+    Results are cached for TTS_PROBE_CACHE_SECONDS; pass force=True to bypass."""
+    if not TTS_BASE_URL:
+        return {"ok": None, "bytes": 0, "error": None, "checked_at": None}
+
+    with _tts_probe_lock:
+        cached_at = _tts_probe_cache.get("checked_at")
+        if not force and cached_at and (time.time() - cached_at) < TTS_PROBE_CACHE_SECONDS:
+            return dict(_tts_probe_cache)
+
+    audio = generate_tts_audio(TTS_PROBE_TEXT, quiet=True)
+    if len(audio) >= TTS_PROBE_MIN_BYTES:
+        result = {"ok": True, "bytes": len(audio), "error": None, "checked_at": time.time()}
+    else:
+        result = {
+            "ok": False,
+            "bytes": len(audio),
+            "error": "no audio — restart kokoro-tts container",
+            "checked_at": time.time(),
+        }
+
+    with _tts_probe_lock:
+        _tts_probe_cache.update(result)
+    return dict(result)
+
 # ====================== STT (whisper.cpp) ======================
 def transcribe_audio(audio_file) -> str:
     """FileStorage -> text via whisper.cpp server"""
@@ -703,6 +768,62 @@ def transcribe_audio(audio_file) -> str:
         except Exception:
             pass
     return ""
+
+WHISPER_PROBE_CACHE_SECONDS = 60
+_whisper_probe_cache = {"ok": None, "error": None, "checked_at": None}
+_whisper_probe_lock = threading.Lock()
+
+def _make_stt_probe_wav(duration_sec: float = 0.5, sample_rate: int = 16000) -> bytes:
+    """Minimal 16 kHz mono WAV for whisper.cpp health checks (silence is fine)."""
+    n_samples = max(1, int(sample_rate * duration_sec))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return buf.getvalue()
+
+def probe_whisper_stt(force: bool = False) -> dict:
+    """Check whether whisper.cpp accepts audio and returns a valid transcription response."""
+    if not WHISPER_BASE_URL:
+        return {"ok": None, "error": None, "checked_at": None}
+
+    with _whisper_probe_lock:
+        cached_at = _whisper_probe_cache.get("checked_at")
+        if not force and cached_at and (time.time() - cached_at) < WHISPER_PROBE_CACHE_SECONDS:
+            return dict(_whisper_probe_cache)
+
+    try:
+        wav = _make_stt_probe_wav()
+        files = {"file": ("probe.wav", wav, "audio/wav")}
+        data = {
+            "model": WHISPER_MODEL,
+            "language": "en",
+            "temperature": "0.0",
+            "response_format": "json",
+        }
+        r = requests.post(
+            f"{WHISPER_BASE_URL}/v1/audio/transcriptions",
+            files=files,
+            data=data,
+            timeout=30,
+        )
+        if r.status_code == 200:
+            r.json()  # validate JSON body
+            result = {"ok": True, "error": None, "checked_at": time.time()}
+        else:
+            result = {
+                "ok": False,
+                "error": f"HTTP {r.status_code}" + (f": {r.text[:80]}" if r.text else ""),
+                "checked_at": time.time(),
+            }
+    except Exception as e:
+        result = {"ok": False, "error": str(e), "checked_at": time.time()}
+
+    with _whisper_probe_lock:
+        _whisper_probe_cache.update(result)
+    return dict(result)
 
 
 # ====================== IMAGE DETECTION (YOLO external server) ======================
@@ -815,6 +936,7 @@ def start_cron_scheduler():
                         if lr.replace(second=0, microsecond=0) == slot:
                             continue
                     job["last_run"] = now
+                    _save_cron_last_run(job["id"], now)
                     print(f"\n⏰ Cron fired [{sched}]: {prompt[:90]}{'...' if len(prompt) > 90 else ''}")
                     try:
                         result = process_with_llm(prompt, internal=True)
@@ -855,15 +977,23 @@ if cron_jobs:
     print(f"   Cron:     {en} job(s) from cron.json{extra}")
 print()
 
+try:
+    wprobe = probe_whisper_stt(force=True)
+    if wprobe.get("ok"):
+        print("   Whisper probe: OK")
+    else:
+        print(f"⚠️  Whisper probe failed: {wprobe.get('error') or 'unknown error'}")
+except Exception as _e:
+    print("⚠️  Whisper probe error (non-fatal):", _e)
+
 # Quick TTS probe so users immediately see if the configured voice is producing audio.
-# (Some Kokoro deploys return 200 + empty body for certain voices like af_heart.)
 if TTS_BASE_URL:
     try:
-        probe = generate_tts_audio("Hi.", quiet=True)
-        if probe:
-            print(f"   TTS probe: OK ({len(probe)} bytes)")
+        probe = probe_tts_synthesis(force=True)
+        if probe.get("ok"):
+            print(f"   TTS probe: OK ({probe['bytes']} bytes)")
         else:
-            print("⚠️  TTS probe returned no audio for current voice. See above for details / voice suggestions.")
+            print(f"⚠️  TTS probe failed: {probe.get('error') or 'no audio'}")
     except Exception as _e:
         print("⚠️  TTS probe error (non-fatal):", _e)
 
@@ -897,6 +1027,16 @@ INDEX_HTML = """<!DOCTYPE html>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     .section-title { font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 600; color: #64748b; }
     .health-value { font-size: 15px; font-weight: 600; line-height: 1.1; }
+    .chat-messages { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+    .chat-messages::-webkit-scrollbar { width: 6px; }
+    .chat-messages::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .chat-bubble { max-width: 85%; word-break: break-word; white-space: pre-wrap; }
+    .chat-bubble-user { margin-left: auto; background: #1e3a5f; border: 1px solid #1e40af; }
+    .chat-bubble-assistant { margin-right: auto; background: #0f172a; border: 1px solid #334155; }
+    .chat-typing span { animation: chat-blink 1.4s infinite both; }
+    .chat-typing span:nth-child(2) { animation-delay: 0.2s; }
+    .chat-typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes chat-blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-200">
@@ -916,7 +1056,7 @@ INDEX_HTML = """<!DOCTYPE html>
               LIVE
             </div>
           </div>
-          <p class="text-slate-400 text-sm mt-0.5">Local voice-first AI agent • Status dashboard</p>
+          <p class="text-slate-400 text-sm mt-0.5">Local voice-first AI agent • Status dashboard &amp; web chat</p>
         </div>
       </div>
 
@@ -949,6 +1089,29 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="text-xs px-3 py-1.5 rounded-2xl bg-slate-900 border border-slate-800 text-slate-400 flex items-center gap-2">
         <span>Auto-refresh</span> 
         <span class="font-mono text-emerald-400">5s</span>
+      </div>
+    </div>
+
+    <!-- Chat -->
+    <div class="mt-6">
+      <div class="section-title mb-2 px-1">Chat</div>
+      <div class="card bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden flex flex-col h-[28rem]">
+        <div id="chat-messages" class="chat-messages flex-1 overflow-y-auto p-4 space-y-3">
+          <div id="chat-empty" class="h-full flex flex-col items-center justify-center text-center text-slate-500 text-sm px-6">
+            <div class="text-2xl mb-2 opacity-60">💬</div>
+            <div>Send a message to Marmot. Responses are text-only from this interface.</div>
+          </div>
+        </div>
+        <div class="border-t border-slate-800 p-3 flex gap-2 items-end">
+          <textarea id="chat-input" rows="1" placeholder="Type a message…"
+                    class="flex-1 resize-none rounded-2xl bg-slate-950 border border-slate-700 px-4 py-2.5 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 focus:border-emerald-500/50"></textarea>
+          <button id="chat-send" onclick="sendChat()"
+                  class="inline-flex items-center justify-center rounded-2xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-medium transition-colors shrink-0">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1024,6 +1187,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <script>
 let lastSeconds = null;
 let lastUpdateTs = Date.now();
+let chatBusy = false;
 
 function tailwindInit() {
   // Tailwind script already loaded via CDN; any custom config could go here.
@@ -1054,17 +1218,49 @@ function renderServices(data) {
   container.innerHTML = "";
 
   const services = [
-    { key: "whisper", label: "Whisper", value: data.whisper || "—", sub: data.whisper_model || "", on: !!data.whisper },
+    (() => {
+      const stt = data.whisper_stt || {};
+      let whisperOn = !!data.whisper;
+      let whisperError = false;
+      let whisperSub = data.whisper_model || "";
+      if (data.whisper) {
+        if (stt.ok === true) {
+          whisperSub = (data.whisper_model || "whisper") + " · transcription OK";
+        } else if (stt.ok === false) {
+          whisperError = true;
+          whisperSub = stt.error || "transcription failed";
+        } else if (!whisperSub) {
+          whisperSub = "not probed yet";
+        }
+      }
+      return { key: "whisper", label: "Whisper", value: data.whisper || "—", sub: whisperSub, on: whisperOn, error: whisperError };
+    })(),
     { key: "llm", label: "LLM", value: data.llm || "—", sub: data.llm_base_url || "", on: true },
-    { key: "tts", label: "TTS", value: data.tts ? ((data.tts_model || "tts") + " / " + (data.tts_voice || "")) : "disabled", sub: data.tts ? "" : "", on: !!data.tts },
+    (() => {
+      const synth = data.tts_synthesis || {};
+      let ttsOn = !!data.tts;
+      let ttsError = false;
+      let ttsSub = "";
+      if (data.tts) {
+        if (synth.ok === true) {
+          ttsSub = "synthesis OK (" + Math.round((synth.bytes || 0) / 1024) + " KB)";
+        } else if (synth.ok === false) {
+          ttsError = true;
+          ttsSub = synth.error || "synthesis failed";
+        } else {
+          ttsSub = "not probed yet";
+        }
+      }
+      return { key: "tts", label: "TTS", value: data.tts ? ((data.tts_model || "tts") + " / " + (data.tts_voice || "")) : "disabled", sub: ttsSub, on: ttsOn, error: ttsError };
+    })(),
     { key: "detect", label: "Detection", value: data.detection || "disabled", sub: "", on: !!data.detection }
   ];
 
   services.forEach(s => {
     const div = document.createElement("div");
     div.className = "bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex flex-col";
-    const dotColor = s.on ? "bg-emerald-400" : "bg-slate-600";
-    const valueText = s.on ? s.value : `<span class="text-slate-400">${s.value}</span>`;
+    const dotColor = s.error ? "bg-red-400" : (s.on ? "bg-emerald-400" : "bg-slate-600");
+    const valueText = (s.on && !s.error) ? s.value : (s.error ? s.value : `<span class="text-slate-400">${s.value}</span>`);
 
     div.innerHTML = `
       <div class="flex items-center gap-2">
@@ -1073,7 +1269,7 @@ function renderServices(data) {
       </div>
       <div class="mt-1.5">
         <div class="health-value break-all">${valueText}</div>
-        ${s.sub ? `<div class="text-[10px] text-slate-500 mono mt-0.5 truncate">${s.sub}</div>` : ''}
+        ${s.sub ? `<div class="text-[10px] ${s.error ? 'text-red-400' : 'text-slate-500'} mono mt-0.5 truncate" title="${s.sub}">${s.sub}</div>` : ''}
       </div>
     `;
     container.appendChild(div);
@@ -1105,7 +1301,13 @@ function renderCron(data) {
     const isOn = c.enabled !== false;
     pill.className = `px-3 py-1 rounded-2xl text-xs border flex items-center gap-1.5 ${isOn ? 'bg-emerald-900/30 border-emerald-800 text-emerald-300' : 'bg-slate-800 border-slate-700 text-slate-400'}`;
 
-    const last = c.last_run ? new Date(c.last_run).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "never";
+    let last = "never";
+    if (c.last_run) {
+      const d = new Date(c.last_run);
+      const sameDay = d.toDateString() === new Date().toDateString();
+      const time = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      last = sameDay ? time : d.toLocaleDateString([], {month:'short', day:'numeric'}) + " " + time;
+    }
     pill.innerHTML = `
       <span class="font-medium">${c.schedule}</span>
       ${!isOn ? '<span class="text-[10px] opacity-60">(off)</span>' : ''}
@@ -1115,9 +1317,10 @@ function renderCron(data) {
   });
 }
 
-async function fetchHealth() {
+async function fetchHealth(forceServiceProbe) {
   try {
-    const res = await fetch("/health", { cache: "no-store" });
+    const url = forceServiceProbe ? "/health?probe=all" : "/health";
+    const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error("bad status " + res.status);
     const data = await res.json();
 
@@ -1186,17 +1389,118 @@ function refreshHealth() {
   fetchHealth();
 }
 
+function setChatBusy(busy) {
+  chatBusy = busy;
+  const input = document.getElementById("chat-input");
+  const sendBtn = document.getElementById("chat-send");
+  if (input) input.disabled = busy;
+  if (sendBtn) sendBtn.disabled = busy;
+}
+
+function appendChatBubble(role, text) {
+  const container = document.getElementById("chat-messages");
+  const empty = document.getElementById("chat-empty");
+  if (!container) return;
+  if (empty) empty.remove();
+
+  const wrap = document.createElement("div");
+  wrap.className = "flex " + (role === "user" ? "justify-end" : "justify-start");
+
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed " +
+    (role === "user" ? "chat-bubble-user text-slate-100" : "chat-bubble-assistant text-slate-200");
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+function appendChatTyping() {
+  const container = document.getElementById("chat-messages");
+  if (!container) return null;
+  const wrap = document.createElement("div");
+  wrap.id = "chat-typing";
+  wrap.className = "flex justify-start";
+  wrap.innerHTML = `
+    <div class="chat-bubble chat-bubble-assistant rounded-2xl px-3.5 py-2.5 text-sm text-slate-400 chat-typing">
+      Marmot is thinking<span>.</span><span>.</span><span>.</span>
+    </div>
+  `;
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+  return wrap;
+}
+
+function removeChatTyping() {
+  const el = document.getElementById("chat-typing");
+  if (el) el.remove();
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const input = document.getElementById("chat-input");
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  appendChatBubble("user", text);
+  input.value = "";
+  input.style.height = "auto";
+  setChatBusy(true);
+  appendChatTyping();
+
+  try {
+    const res = await fetch("/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text, text_only: true })
+    });
+    removeChatTyping();
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(err || ("HTTP " + res.status));
+    }
+    const data = await res.json();
+    appendChatBubble("assistant", data.text || "(empty response)");
+    fetchHealth();
+  } catch (e) {
+    removeChatTyping();
+    appendChatBubble("assistant", "Error: " + e.message);
+  } finally {
+    setChatBusy(false);
+    input.focus();
+  }
+}
+
+function initChatInput() {
+  const input = document.getElementById("chat-input");
+  if (!input) return;
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChat();
+    }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 120) + "px";
+  });
+}
+
 function startAutoRefresh() {
-  // Initial fetch
-  fetchHealth();
-  // Full refresh every 5 seconds
-  setInterval(fetchHealth, 5000);
+  // Initial fetch includes live Whisper + TTS probes
+  fetchHealth(true);
+  // Full refresh every 5 seconds (service probes cached server-side ~60s)
+  setInterval(() => fetchHealth(false), 5000);
+  // Force fresh Whisper + TTS checks every 60 seconds
+  setInterval(() => fetchHealth(true), 60000);
   // Smooth relative time updates every 1s
   setInterval(updateRelativeTimes, 1000);
 }
 
 window.onload = function() {
   tailwindInit();
+  initChatInput();
   startAutoRefresh();
 };
 </script>
@@ -1219,9 +1523,12 @@ def connect():
         if f and f.filename:
             user_text = transcribe_audio(f)
 
+    text_only = False
     if not user_text:
         if request.is_json:
-            user_text = (request.json or {}).get("text", "")
+            body = request.json or {}
+            user_text = body.get("text", "")
+            text_only = bool(body.get("text_only"))
         else:
             user_text = request.form.get("text", "")
         user_text = (user_text or "").strip()
@@ -1244,8 +1551,10 @@ def connect():
     final = process_with_llm(user_text)
     print(f"🐹 Marmot: {final[:160]}{'...' if len(final) > 160 else ''}")
 
-    audio_b = generate_tts_audio(final)
-    audio_b64 = base64.b64encode(audio_b).decode("ascii") if audio_b else None
+    audio_b64 = None
+    if not text_only:
+        audio_b = generate_tts_audio(final)
+        audio_b64 = base64.b64encode(audio_b).decode("ascii") if audio_b else None
 
     return jsonify({
         "transcription": user_text,
@@ -1272,15 +1581,30 @@ def health():
         for j in cron_jobs
     ]
 
+    probe_arg = (request.args.get("probe") or "").strip().lower()
+    force_all = probe_arg in ("1", "true", "all", "yes")
+    force_whisper = force_all or probe_arg == "whisper"
+    force_tts = force_all or probe_arg == "tts"
+
+    whisper_stt = probe_whisper_stt(force=force_whisper)
+    tts_synthesis = probe_tts_synthesis(force=force_tts) if TTS_BASE_URL else None
+    ok = True
+    if whisper_stt.get("ok") is False:
+        ok = False
+    if tts_synthesis and tts_synthesis.get("ok") is False:
+        ok = False
+
     return jsonify({
-        "ok": True,
+        "ok": ok,
         "whisper": WHISPER_BASE_URL,
         "whisper_model": WHISPER_MODEL,
+        "whisper_stt": whisper_stt,
         "llm": LLM_MODEL,
         "llm_base_url": LLM_BASE_URL,
         "tts": bool(TTS_BASE_URL),
         "tts_model": TTS_MODEL if TTS_BASE_URL else None,
         "tts_voice": TTS_VOICE if TTS_BASE_URL else None,
+        "tts_synthesis": tts_synthesis,
         "detection": DETECTION_BASE_URL,
         "turns": len([m for m in conversation_history if m["role"] in ("user", "assistant")]),
         "context_timeout_hours": CONTEXT_TIMEOUT_HOURS,

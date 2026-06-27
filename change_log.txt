@@ -1,6 +1,12 @@
 marmot-harness change log
 
 -----------------------
+june 27 2026
+- added a chat interface to the main web page.
+- adjusted health checks to catch issues with tts and stt servers
+- minor adjustments
+
+-----------------------
 june 15 2026
 - / now is a simple website displaying the system health in a easy to read format
 - minor adjustments

@@ -16,5 +16,11 @@
     "prompt": "Quick systems check using tools if needed. If load, disk space, or memory looks concerning, give a short heads-up. Otherwise stay quiet.",
     "enabled": false,
     "comment": "Example of a disabled job (resource monitoring). Set to true to activate."
+  },
+  {
+    "schedule": "0 7 * * *",
+    "prompt": "Morning check-in: Run `curl -s 'wttr.in/Dallas?format=3'` to fetch Dallas weather. Your reply will be spoken aloud via TTS — output only the briefing text, not the raw curl output. Keep it to 2-4 short conversational sentences (under 400 characters). Use plain prose: no bullets, tables, markdown, emojis, URLs, or symbols. Say temperatures naturally (e.g. \"75 degrees\"). Cover current conditions plus one useful detail for the day (high, rain chance, or wind).",
+    "enabled": false,
+    "comment": "Morning weather briefing (TTS-friendly). Change Dallas to your city; set enabled to true to activate."
   }
 ]

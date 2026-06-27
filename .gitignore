@@ -44,3 +44,6 @@ Thumbs.db
 
 # Agent sandbox (tools default cwd here)
 agent-data/
+
+# Cron last-run timestamps (runtime state)
+server/code/cron_state.json
