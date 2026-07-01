@@ -47,3 +47,6 @@ agent-data/
 
 # Cron last-run timestamps (runtime state)
 server/code/cron_state.json
+
+# Whisper.cpp repo (cloned by start_whisper_cuda.sh)
+server/whisper.cpp/whisper.cpp/

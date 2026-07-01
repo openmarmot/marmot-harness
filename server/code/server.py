@@ -52,7 +52,7 @@ def load_config():
         "SYSTEM_PROMPT": "You are Marmot, a helpful local AI agent running on the user's machine. You have tools to inspect and control the Linux system and to search the web for current events or facts not on this machine. Use tools when needed to answer accurately. Be concise in final answers. Always think step-by-step before calling tools.",
         "TOOLS_ENABLED": True,
         "TOOL_TIMEOUT": 30,
-        "MAX_TOOL_TURNS": 8,
+        "MAX_TOOL_TURNS": 15,
         "CONTEXT_TIMEOUT_HOURS": 10,
         "DETECTION_BASE_URL": None,
         "WEB_SEARCH_ENABLED": True,
@@ -733,7 +733,20 @@ def process_with_llm(user_text: str, internal: bool = False) -> str:
 
             if msg.get("tool_calls"):
                 for tc in msg.get("tool_calls", []):
-                    print(f"  🔧 {tc.get('function', {}).get('name', 'tool')}")
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "tool")
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        args = {}
+                    if name == "web_search":
+                        q = args.get("query", "")
+                        print(f"  🔧 web_search: {q}" if q else "  🔧 web_search")
+                    elif name == "run_terminal":
+                        cmd = args.get("command", "")
+                        print(f"  🔧 run_terminal: {cmd}" if cmd else "  🔧 run_terminal")
+                    else:
+                        print(f"  🔧 {name}")
                     out = execute_tool(tc)
                     messages.append({
                         "role": "tool",
@@ -751,6 +764,12 @@ def process_with_llm(user_text: str, internal: bool = False) -> str:
             final_text = f"(LLM failure: {e})"
             break
 
+    if not final_text:
+        # All tool turns exhausted without a final response — let the user know.
+        fallback = "(Response unavailable — the model used all available tool turns without producing a final answer.)"
+        if not internal:
+            conversation_history.append({"role": "assistant", "content": fallback})
+        final_text = fallback
     trim_conversation_history()
     return final_text
 
